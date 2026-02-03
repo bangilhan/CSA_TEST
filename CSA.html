@@ -3423,7 +3423,10 @@ Three.js · PapaParse · Pure JavaScript`
                     // 단일 파일 선택 (라디오 버튼 사용)
                     this.selectedCSVFile = null;
                     
-                    csvFiles.forEach(file => {
+                    // df_mock_20260129.csv만 표시하도록 필터링
+                    const filteredFiles = csvFiles.filter(file => file.name === 'df_mock_20260129.csv');
+                    
+                    filteredFiles.forEach(file => {
                         const li = document.createElement('li');
                         li.style.display = 'flex';
                         li.style.alignItems = 'center';
