@@ -941,7 +941,7 @@
                         <div id="focus-view-selector" style="display: flex; gap: 8px; margin-bottom: 15px; flex-wrap: wrap;">
                             <button id="focus-anomalies-tab" class="focus-tab-btn" style="padding: 8px 16px; background: #2a2f3e; color: #fff; border: 1px solid #3a3f4e; border-radius: 4px; cursor: pointer;">주요 이상 구간 분석</button>
                             <button id="focus-killsets-tab" class="focus-tab-btn" style="padding: 8px 16px; background: #2a2f3e; color: #fff; border: 1px solid #3a3f4e; border-radius: 4px; cursor: pointer;">HIT-KILL SET 분석</button>
-                            <button id="focus-events-tab" class="focus-tab-btn" style="padding: 8px 16px; background: #2a2f3e; color: #fff; border: 1px solid #3a3f4e; border-radius: 4px; cursor: pointer;">주요 이벤트 시점 분석</button>
+                            <button id="focus-events-tab" class="focus-tab-btn" style="padding: 8px 16px; background: #2a2f3e; color: #fff; border: 1px solid #3a3f4e; border-radius: 4px; cursor: pointer;">주요 이벤트 시점 확인</button>
                             <button id="exit-focus-btn" style="padding: 8px 16px; background: #6c757d; color: #fff; border: none; border-radius: 4px; cursor: pointer;">포커스모드 종료</button>
                         </div>
                         <div id="focus-anomalies-list" class="focus-content-panel" style="display: none; height: 400px; overflow-y: auto; background: #1a1f2e; border-radius: 4px; padding: 10px; margin-bottom: 20px;">
@@ -1909,6 +1909,97 @@
                 return aimData;
             }
 
+            // Kill Set 단위 angular_error_theta / angular_error_std_hit_kill 수집
+            // 사전 계산된 컬럼만 그대로 사용하며, 추가 통계 계산은 하지 않는다.
+            collectAngularErrorDataForKillSet(killSet) {
+                if (!this.data || !this.data.positions || !killSet) {
+                    return { rows: [], setId: null, std: null };
+                }
+
+                const attackerName = killSet.attacker;
+                const rows = [];
+                let setId = null;
+                let stdVal = null;
+
+                const startIdx = this.data.positions.findIndex(p => p.tick >= killSet.startTick);
+                const endIdx = this.data.positions.findIndex(p => p.tick >= killSet.endTick);
+
+                if (startIdx === -1 || endIdx === -1) {
+                    console.warn(`[AngularError] 틱 범위를 찾을 수 없음: startTick=${killSet.startTick}, endTick=${killSet.endTick}`);
+                    return { rows: [], setId: null, std: null };
+                }
+
+                for (let idx = startIdx; idx <= endIdx; idx++) {
+                    const pos = this.data.positions[idx];
+                    if (!pos || !pos.players) continue;
+
+                    const player = pos.players.find(p => p.name === attackerName);
+                    if (!player) continue;
+
+                    // hit_kill_set_id: NaN/Null 제외
+                    let rawSetId = player.hit_kill_set_id;
+                    if (rawSetId === undefined || rawSetId === null) continue;
+                    if (typeof rawSetId !== 'number') {
+                        const parsed = parseFloat(String(rawSetId));
+                        if (Number.isNaN(parsed)) continue;
+                        rawSetId = parsed;
+                    }
+
+                    if (Number.isNaN(rawSetId)) continue;
+                    if (setId === null) {
+                        setId = rawSetId;
+                    } else if (setId !== rawSetId) {
+                        // 하나의 Kill Set 안에는 하나의 hit_kill_set_id만 있어야 함
+                        continue;
+                    }
+
+                    // angular_error_theta: 그래프용 Y축 값
+                    let theta = player.angular_error_theta;
+                    if (theta === undefined || theta === null) continue;
+                    if (typeof theta !== 'number') {
+                        const parsedTheta = parseFloat(String(theta));
+                        if (Number.isNaN(parsedTheta)) continue;
+                        theta = parsedTheta;
+                    }
+                    if (Number.isNaN(theta)) continue;
+
+                    // angular_error_std_hit_kill: SET 요약 값 (첫 HIT row에만 존재)
+                    if (stdVal === null && player.angular_error_std_hit_kill !== undefined && player.angular_error_std_hit_kill !== null) {
+                        let stdCandidate = player.angular_error_std_hit_kill;
+                        if (typeof stdCandidate !== 'number') {
+                            const parsedStd = parseFloat(String(stdCandidate));
+                            if (!Number.isNaN(parsedStd)) {
+                                stdCandidate = parsedStd;
+                            } else {
+                                stdCandidate = null;
+                            }
+                        }
+                        if (stdCandidate !== null && !Number.isNaN(stdCandidate)) {
+                            stdVal = stdCandidate;
+                        }
+                    }
+
+                    // 이벤트 타입: 기존 Kill Set 정보에서만 읽어옴 (추가 계산 없음)
+                    let eventType = null;
+                    const tick = pos.tick;
+                    if (killSet.killEvent && tick === killSet.killEvent.tick) {
+                        eventType = 'kill';
+                    } else if (killSet.hitEvents && killSet.hitEvents.some(h => h.tick === tick)) {
+                        eventType = 'hit';
+                    }
+
+                    rows.push({
+                        tick: tick,
+                        tickIdx: idx,
+                        game_time: pos.game_time,
+                        angular_error_theta: theta,
+                        eventType: eventType
+                    });
+                }
+
+                return { rows, setId, std: stdVal };
+            }
+
             // Kill Set 목록 표시 (포커스 모드용)
             renderKillSetsList() {
                 const container = document.getElementById('focus-killsets-list');
@@ -2120,6 +2211,8 @@
                 
                 // 포커스 모드 활성화 (renderAimTrace가 작동하려면 필요)
                 this.focusMode = true;
+                // 주요 이벤트 시점 확인 모드임을 명시 (aim trace 비활성화를 위해)
+                this.focusModeType = 'event-zoom';
                 
                 // 주요 이벤트 시점 분석용 focusTickRange 설정 (±30 tick)
                 const preContext = 30;
@@ -2133,60 +2226,178 @@
                     end: this.data.positions[endIdx].game_time
                 };
                 
-                // 이벤트 선택 (selectEvent는 selectedEventForZoom이 있으면 selectedHitToKillSequence를 설정하지 않음)
-                this.selectEvent(event);
-                
-                // 추가 안전장치: 주요 이벤트 시점 분석에서는 조준 밀집도 분석을 표시하지 않음
-                this.selectedHitToKillSequence = null;
-                
-                // source player와 target player 좌표 가져오기
+                // source player와 target player 좌표 가져오기 (selectEvent 호출 전에 먼저 처리)
                 const tickData = this.data.positions[tickIndex];
-                if (!tickData || !tickData.players) return;
+                if (!tickData || !tickData.players) {
+                    console.warn('jumpToEventWithZoom: tickData 또는 players가 없습니다.');
+                    return;
+                }
                 
                 const sourcePlayer = event.attacker ? tickData.players.find(p => p.name === event.attacker.name) : null;
                 const targetPlayer = event.victim ? tickData.players.find(p => p.name === event.victim.name) : null;
                 
-                if (!sourcePlayer || !targetPlayer || !sourcePlayer.position || !targetPlayer.position) {
-                    console.warn('플레이어 위치를 찾을 수 없습니다.');
+                // source나 target이 없으면 event에서 직접 가져오기
+                if (!sourcePlayer && event.attacker && event.attacker.position) {
+                    console.warn('sourcePlayer를 tickData에서 찾을 수 없어 event.attacker.position 사용');
+                }
+                if (!targetPlayer && event.victim && event.victim.position) {
+                    console.warn('targetPlayer를 tickData에서 찾을 수 없어 event.victim.position 사용');
+                }
+                
+                // 최소한 event에서 위치 정보가 있어야 함
+                if (!sourcePlayer && !event.attacker?.position) {
+                    console.warn('플레이어 위치를 찾을 수 없습니다 (source).');
+                    return;
+                }
+                if (!targetPlayer && !event.victim?.position) {
+                    console.warn('플레이어 위치를 찾을 수 없습니다 (target).');
                     return;
                 }
                 
+                // 추가 안전장치: 주요 이벤트 시점 분석에서는 조준 밀집도 분석을 표시하지 않음
+                this.selectedHitToKillSequence = null;
+                
+                // 이벤트 선택 (카메라 설정 전에 호출하되, 렌더링은 하지 않도록)
+                // selectedEventForZoom이 설정되어 있으므로 selectEvent에서 렌더링을 건너뛸 것
+                this.selectEvent(event);
+                
                 // source와 target 플레이어 좌표 (position: [X, Z, Y])
+                // sourcePlayer가 없으면 event.attacker.position 사용
+                const sourcePosition = sourcePlayer?.position || event.attacker?.position;
+                const targetPosition = targetPlayer?.position || event.victim?.position;
+                
+                if (!sourcePosition || !targetPosition) {
+                    console.error('플레이어 위치 데이터가 없습니다:', {
+                        sourcePlayer: !!sourcePlayer,
+                        targetPlayer: !!targetPlayer,
+                        sourcePosition: !!sourcePosition,
+                        targetPosition: !!targetPosition
+                    });
+                    return;
+                }
+                
+                // 원본 좌표 (스케일링 전)
+                const sourcePosRaw = {
+                    x: sourcePosition[0],
+                    y: sourcePosition[2], // Z -> Y
+                    z: sourcePosition[1]  // Y -> Z
+                };
+                
+                const targetPosRaw = {
+                    x: targetPosition[0],
+                    y: targetPosition[2], // Z -> Y
+                    z: targetPosition[1]  // Y -> Z
+                };
+                
+                // 스케일링된 좌표 (카메라 설정용)
                 const sourcePos = {
-                    x: sourcePlayer.position[0],
-                    y: sourcePlayer.position[2], // Z -> Y
-                    z: sourcePlayer.position[1]  // Y -> Z
+                    x: (sourcePosRaw.x - this.coordinateOffset.x) * this.coordinateScale,
+                    // sourcePosRaw.y는 game Z 이므로 coordinateOffset.z 를 빼야 함
+                    y: (sourcePosRaw.y - this.coordinateOffset.z) * this.coordinateScale,
+                    // sourcePosRaw.z는 game Y 이므로 coordinateOffset.y 를 빼야 함
+                    z: (sourcePosRaw.z - this.coordinateOffset.y) * this.coordinateScale
                 };
                 
                 const targetPos = {
-                    x: targetPlayer.position[0],
-                    y: targetPlayer.position[2], // Z -> Y
-                    z: targetPlayer.position[1]  // Y -> Z
+                    x: (targetPosRaw.x - this.coordinateOffset.x) * this.coordinateScale,
+                    y: (targetPosRaw.y - this.coordinateOffset.z) * this.coordinateScale,
+                    z: (targetPosRaw.z - this.coordinateOffset.y) * this.coordinateScale
                 };
                 
-                // 두 플레이어의 중앙 좌표 계산
-                const centerPos = {
-                    x: (sourcePos.x + targetPos.x) / 2,
-                    y: (sourcePos.y + targetPos.y) / 2,
-                    z: (sourcePos.z + targetPos.z) / 2
-                };
+                // 관계(ATTACKER/VICTIM)가 "딱 줌인된 채로 중앙"에 오도록
+                // 전체 플레이어가 아니라 source/target(관계 대상) 중심으로 카메라 프레이밍한다.
+                let minX = Math.min(sourcePos.x, targetPos.x);
+                let maxX = Math.max(sourcePos.x, targetPos.x);
+                let minY = Math.min(sourcePos.y, targetPos.y);
+                let maxY = Math.max(sourcePos.y, targetPos.y);
+                let minZ = Math.min(sourcePos.z, targetPos.z);
+                let maxZ = Math.max(sourcePos.z, targetPos.z);
+
+                const relDx = sourcePos.x - targetPos.x;
+                const relDy = sourcePos.y - targetPos.y;
+                const relDz = sourcePos.z - targetPos.z;
+                const relDist = Math.sqrt(relDx * relDx + relDy * relDy + relDz * relDz);
+                // 라벨/링/연결선 공간 포함해서 여유 확보 (관계가 가까울수록 최소 마진 적용)
+                const relationshipMargin = Math.max(80, relDist * 0.8);
+                minX -= relationshipMargin; maxX += relationshipMargin;
+                minY -= relationshipMargin; maxY += relationshipMargin;
+                minZ -= relationshipMargin; maxZ += relationshipMargin;
                 
-                // 두 플레이어 사이의 거리 계산
-                const dx = sourcePos.x - targetPos.x;
-                const dy = sourcePos.y - targetPos.y;
-                const dz = sourcePos.z - targetPos.z;
-                const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                // 플레이어들이 보이는 영역의 중심과 크기 계산
+                // minX, maxX 등이 Infinity인 경우 처리
+                if (minX === Infinity || maxX === -Infinity) {
+                    // 플레이어 위치 수집이 실패한 경우 source와 target만 사용
+                    minX = Math.min(sourcePos.x, targetPos.x);
+                    maxX = Math.max(sourcePos.x, targetPos.x);
+                    minY = Math.min(sourcePos.y, targetPos.y);
+                    maxY = Math.max(sourcePos.y, targetPos.y);
+                    minZ = Math.min(sourcePos.z, targetPos.z);
+                    maxZ = Math.max(sourcePos.z, targetPos.z);
+                    console.warn('플레이어 위치 수집 실패, source/target만 사용');
+                }
                 
-                // 카메라 거리 조정 (두 플레이어가 화면 중앙에 딱 잡히도록)
-                const padding = 1.5; // 여유 공간
-                this.cameraDistance = Math.max(300, Math.min(1200, distance * padding));
+                const width = maxX - minX;
+                const height = maxY - minY;
+                const depth = maxZ - minZ;
+                const maxDim = Math.max(width, height, depth);
+                
+                // 최소 크기 보장 (플레이어가 너무 가까이 있으면 최소 영역 확보)
+                const minSize = 60; // 너무 가까이 붙어도 최소 영역 확보 (줌인 유지)
+                const actualWidth = Math.max(width, minSize);
+                const actualHeight = Math.max(height, minSize);
+                const actualDepth = Math.max(depth, minSize);
+                const actualMaxDim = Math.max(actualWidth, actualHeight, actualDepth);
                 
                 // 카메라 타겟을 중앙 좌표로 설정
-                this.cameraTarget = centerPos;
+                const centerX = (minX + maxX) / 2;
+                const centerY = (minY + maxY) / 2;
+                const centerZ = (minZ + maxZ) / 2;
+                this.cameraTarget = {
+                    x: centerX,
+                    // minY/maxY는 Three.js Y(=scaledZ), minZ/maxZ는 Three.js Z(=scaledY)로 누적했으므로
+                    // cameraTarget도 동일 축으로 그대로 넣어야 한다.
+                    y: centerY, // Three.js Y축
+                    z: centerZ  // Three.js Z축
+                };
                 
-                // 카메라 각도 설정
+                // FOV와 aspect ratio를 고려하여 정확한 카메라 거리 계산 (fitToView와 동일한 방식)
+                const fov = this.camera.fov * (Math.PI / 180);
+                const container = document.getElementById('canvas-container');
+                const viewHeight = container ? container.clientHeight : 600;
+                const viewWidth = container ? container.clientWidth : 800;
+                const aspect = viewWidth / viewHeight;
+                
+                // 스케일링된 좌표 기준으로 거리 계산
+                const scaledWidth = actualWidth;
+                const scaledHeight = actualHeight;
+                const scaledDepth = actualDepth;
+                
+                // 3D 뷰이므로 높이도 고려 (fitToView와 동일한 계산)
+                // 라벨 높이도 고려하여 여유 공간 확보
+                const labelHeightOffset = 100; // 라벨 높이 여유 공간
+                const distanceX = ((scaledWidth / 2) / Math.tan(fov / 2) / aspect) + labelHeightOffset;
+                const distanceZ = ((scaledDepth / 2) / Math.tan(fov / 2)) + labelHeightOffset;
+                const distanceY = ((scaledHeight / 2) / Math.tan(fov / 2)) + labelHeightOffset;
+                // 관계도는 더 "줌인"되어 보여야 하므로 1.0 배수로 조정
+                this.cameraDistance = Math.max(distanceX, distanceZ, distanceY) * 1.0;
+                
+                // 최소/최대 거리 제한 (너무 가깝거나 멀지 않도록)
+                const minDistance = 200; // 이벤트 관계도는 더 가깝게
+                const maxDistance = viewWidth * 2.5; // 화면 너비의 2.5배까지
+                this.cameraDistance = Math.max(minDistance, Math.min(maxDistance, this.cameraDistance));
+                
+                // 카메라 각도 설정 (전체 맵이 잘 보이도록)
                 this.cameraRotationX = 0.4;
                 this.cameraRotationY = Math.PI / 4; // 45도 각도
+                
+                console.log('카메라 설정 완료:', {
+                    center: { x: centerX, y: centerY, z: centerZ },
+                    bounds: { width: actualWidth, height: actualHeight, depth: actualDepth },
+                    scaled: { width: scaledWidth, height: scaledHeight, depth: scaledDepth },
+                    distances: { x: distanceX, z: distanceZ, y: distanceY },
+                    finalDistance: this.cameraDistance,
+                    cameraTarget: this.cameraTarget
+                });
                 
                 // 패닝 오프셋 초기화
                 if (this.panOffset) {
@@ -2196,9 +2407,11 @@
                 }
                 
                 // source와 target 플레이어 사이에 선 그리기 (렌더링 전에 먼저 설정)
+                // Three.js 좌표계(스케일링된 좌표)로 전달해야 씬에서 올바른 위치에 그려짐
                 this.drawPlayerConnectionLine(sourcePos, targetPos);
                 
                 // 현재 이벤트 위치 정보 저장 (연결선 유지용) - selectedEventForZoom은 이미 위에서 설정됨
+                // 스케일링된 Three 좌표 저장 (drawPlayerConnectionLine에서 사용)
                 this.selectedEventSourcePos = sourcePos;
                 this.selectedEventTargetPos = targetPos;
                 
@@ -2234,23 +2447,59 @@
                     console.log('Aim Trace 탭 활성화 완료');
                 }
                 
-                // 카메라 업데이트 (렌더링 전에 먼저 업데이트)
+                // 카메라를 확실히 업데이트 (fitToView와 동일한 방식으로)
+                // 카메라 설정이 완료된 후 즉시 업데이트
+                console.log('카메라 업데이트 시작:', {
+                    cameraTarget: this.cameraTarget,
+                    cameraDistance: this.cameraDistance,
+                    cameraRotationX: this.cameraRotationX,
+                    cameraRotationY: this.cameraRotationY
+                });
+                
+                // 동기적으로 카메라 업데이트
                 this.updateCamera();
                 if (this.updateCameraToTarget) {
                     this.updateCameraToTarget();
                 }
                 
-                // 렌더링 (연결선이 포함된 상태로)
+                // 이벤트 렌더링 (hit과 kill 이벤트 시각화)
+                this.renderEvents(tickData.game_time);
+                
+                // 즉시 렌더링 (첫 화면이 바로 보이도록)
+                // currentTick을 확실히 설정하여 포커스 범위 체크 통과
+                this.currentTick = tickIndex;
                 this.renderTick(tickIndex, 0);
                 this.updateTimeDisplay();
                 
-                // 캐릭터 시뮬레이션 렌더링 동기화 (다시 렌더링하여 확실히 업데이트)
-                setTimeout(() => {
+                // 다음 프레임에서도 확실히 업데이트 (비동기 처리)
+                requestAnimationFrame(() => {
+                    // currentTick을 다시 확인하여 포커스 범위 내에 있도록 보장
+                    this.currentTick = tickIndex;
+                    
+                    // 카메라가 덮어씌워졌을 수 있으므로 다시 설정
+                    if (this.cameraTarget && this.selectedEventForZoom) {
+                        // 카메라 설정이 유지되도록 다시 적용
+                        this.updateCamera();
+                        if (this.updateCameraToTarget) {
+                            this.updateCameraToTarget();
+                        }
+                    }
                     this.renderTick(tickIndex, 0);
+                    this.updateTimeDisplay();
+                    
+                    // 한 번 더 확실히 (카메라가 완전히 적용되도록)
+                    requestAnimationFrame(() => {
+                        this.currentTick = tickIndex;
+                        if (this.cameraTarget && this.selectedEventForZoom) {
+                            this.updateCamera();
                     if (this.updateCameraToTarget) {
                         this.updateCameraToTarget();
                     }
-                }, 10);
+                        }
+                        this.renderTick(tickIndex, 0);
+                        this.updateTimeDisplay();
+                    });
+                });
                 
                 // Aim Trace 시각화 렌더링 (여러 번 호출하여 확실히 표시)
                 console.log('renderAimTrace 호출 전:', {
@@ -2278,10 +2527,9 @@
                 
                 console.log('이벤트로 점프 완료:', {
                     event: event.event_type_lower,
-                    source: sourcePlayer.name,
-                    target: targetPlayer.name,
-                    center: centerPos,
-                    distance: distance,
+                    source: sourcePlayer?.name || event.attacker?.name,
+                    target: targetPlayer?.name || event.victim?.name,
+                    cameraTarget: this.cameraTarget,
                     cameraDistance: this.cameraDistance
                 });
             }
@@ -2294,12 +2542,13 @@
                     this.playerConnectionLine = null;
                 }
                 
-                // 선 재료 생성
+                // 선 재료 생성 (주요 이벤트 시점 확인 모드에서는 더 두껍고 밝게)
+                const isEventZoomMode = !!this.selectedEventForZoom;
                 const lineMaterial = new THREE.LineBasicMaterial({ 
-                    color: 0x4a90e2, 
-                    linewidth: 3,
-                    opacity: 0.8,
-                    transparent: true
+                    color: isEventZoomMode ? 0xffff00 : 0x4a90e2, // 노란색으로 변경하여 더 명확하게
+                    linewidth: isEventZoomMode ? 8 : 3, // 더 두껍게
+                    opacity: isEventZoomMode ? 1.0 : 0.8, // 더 불투명하게
+                    transparent: isEventZoomMode ? false : true
                 });
                 
                 // 선 지오메트리 생성
@@ -2342,9 +2591,15 @@
                     
                     // bottom-panel 항상 표시 보장 (포커스 모드 공통 적용)
                     this.ensureBottomPanelVisible();
+                    
+                    // Kill 이벤트 시점으로 이동하고 관계도 표시 (카메라 설정 포함)
+                    if (killSet.killEvent) {
+                        // jumpToKillEventWithZoom이 카메라 설정과 렌더링을 모두 수행
+                        this.jumpToKillEventWithZoom(killSet.killEvent);
+                    }
                 }
 
-                // Aim Trace 탭 자동 활성화 및 렌더링
+                // Aim Trace 탭 자동 활성화 (jumpToKillEventWithZoom에서 이미 처리되지만 안전장치)
                 const aimTabBtn = document.querySelector('.tab-btn[data-tab="aim"]');
                 const actionsTabBtn = document.querySelector('.tab-btn[data-tab="actions"]');
                 if (aimTabBtn && actionsTabBtn) {
@@ -2356,16 +2611,144 @@
                         eventLog.classList.remove('action-stream');
                         eventLog.classList.add('aim-trace');
                     }
-                    // dispatchEvent 제거: setupTabs 리스너 재실행 → innerHTML 초기화 충돌
                 }
                 
-                // 단일 렌더링 호출
+                // jumpToKillEventWithZoom에서 이미 렌더링을 수행하므로 추가 렌더링은 최소화
+                // 단, 카메라가 제대로 설정되었는지 확인하기 위해 한 번 더 호출
+                if (killSet.killEvent) {
                 requestAnimationFrame(() => {
                     this.renderAimTrace();
                 });
+                }
+            }
+            
+            // Kill 이벤트로 점프하고 source/target 플레이어를 중앙에 배치하고 선으로 연결
+            jumpToKillEventWithZoom(killEvent) {
+                // IMPORTANT:
+                // - HIT-KILL SET 분석에서는 focusModeType이 'kill-set'을 유지해야 하며
+                //   selectedKillSet을 절대 초기화하면 안 됨 (조준 안정성 차트가 사라짐).
+                // - 따라서 jumpToEventWithZoom(=event-zoom 전용)을 호출하지 않고,
+                //   kill-set 전용으로 카메라/렌더링만 수행한다.
+                if (!killEvent || killEvent.tick === undefined) return;
+
+                const tickIndex = this.data.positions.findIndex(p => p.tick === killEvent.tick);
+                if (tickIndex === -1) return;
+
+                const tickData = this.data.positions[tickIndex];
+                if (!tickData || !tickData.players) {
+                    console.warn('jumpToKillEventWithZoom: tickData 또는 players가 없습니다.');
+                    return;
+                }
+
+                // 상태: kill-set 모드 유지 + selectedKillSet 유지
+                this.focusMode = true;
+                this.focusModeType = 'kill-set';
+                this.selectedEventForZoom = null; // 주요 이벤트 시점 확인 모드 전용 상태는 항상 해제
+
+                // 관계도 표시를 위해 선택 이벤트는 지정(단, selectEvent는 호출하지 않음: focusModeType 덮어쓰기 방지)
+                this.selectedEvent = killEvent;
+
+                // 해당 tick으로 점프
+                this.currentTick = tickIndex;
+
+                // HIT-KILL SET 분석도 관계(ATTACKER/VICTIM)가 중앙에 줌인되도록 프레이밍
+                // killEvent의 attacker/victim을 현재 tickData.players에서 우선 찾는다.
+                const attackerName = killEvent.attacker?.name;
+                const victimName = killEvent.victim?.name;
+
+                const attackerInTick = attackerName ? tickData.players.find(p => p.name === attackerName) : null;
+                const victimInTick = victimName ? tickData.players.find(p => p.name === victimName) : null;
+
+                const attackerPosArr = attackerInTick?.position || killEvent.attacker?.position;
+                const victimPosArr = victimInTick?.position || killEvent.victim?.position;
+
+                let minX, maxX, minY, maxY, minZ, maxZ;
+                if (attackerPosArr && victimPosArr && attackerPosArr[0] !== null && victimPosArr[0] !== null) {
+                    const ax = (attackerPosArr[0] - this.coordinateOffset.x) * this.coordinateScale;
+                    const ay = (attackerPosArr[2] - this.coordinateOffset.z) * this.coordinateScale; // game Z -> Three Y
+                    const az = (attackerPosArr[1] - this.coordinateOffset.y) * this.coordinateScale; // game Y -> Three Z
+
+                    const vx = (victimPosArr[0] - this.coordinateOffset.x) * this.coordinateScale;
+                    const vy = (victimPosArr[2] - this.coordinateOffset.z) * this.coordinateScale;
+                    const vz = (victimPosArr[1] - this.coordinateOffset.y) * this.coordinateScale;
+
+                    minX = Math.min(ax, vx); maxX = Math.max(ax, vx);
+                    minY = Math.min(ay, vy); maxY = Math.max(ay, vy);
+                    minZ = Math.min(az, vz); maxZ = Math.max(az, vz);
+
+                    const dx = ax - vx, dy = ay - vy, dz = az - vz;
+                    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    const margin = Math.max(80, dist * 0.8);
+                    minX -= margin; maxX += margin;
+                    minY -= margin; maxY += margin;
+                    minZ -= margin; maxZ += margin;
+                } else {
+                    // 폴백: 관계 대상 좌표가 없으면 전체 플레이어 기준
+                    minX = Infinity; maxX = -Infinity;
+                    minY = Infinity; maxY = -Infinity;
+                    minZ = Infinity; maxZ = -Infinity;
+                    tickData.players.forEach(player => {
+                        if (!player.position || !Array.isArray(player.position)) return;
+                        const x = (player.position[0] - this.coordinateOffset.x) * this.coordinateScale;
+                        const y = (player.position[2] - this.coordinateOffset.z) * this.coordinateScale;
+                        const z = (player.position[1] - this.coordinateOffset.y) * this.coordinateScale;
+                        if (!Number.isNaN(x)) { minX = Math.min(minX, x); maxX = Math.max(maxX, x); }
+                        if (!Number.isNaN(y)) { minY = Math.min(minY, y); maxY = Math.max(maxY, y); }
+                        if (!Number.isNaN(z)) { minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z); }
+                    });
+                    if (minX === Infinity || maxX === -Infinity) {
+                        minX = -100; maxX = 100;
+                        minY = -100; maxY = 100;
+                        minZ = -100; maxZ = 100;
+                    }
+                }
+
+                const width = maxX - minX;
+                const height = maxY - minY;
+                const depth = maxZ - minZ;
+                const minSize = 60;
+                const actualWidth = Math.max(width, minSize);
+                const actualHeight = Math.max(height, minSize);
+                const actualDepth = Math.max(depth, minSize);
+
+                const centerX = (minX + maxX) / 2;
+                const centerY = (minY + maxY) / 2;
+                const centerZ = (minZ + maxZ) / 2;
+
+                this.cameraTarget = { x: centerX, y: centerY, z: centerZ };
+
+                const fov = this.camera.fov * (Math.PI / 180);
+                const container = document.getElementById('canvas-container');
+                const viewH = container ? container.clientHeight : 600;
+                const viewW = container ? container.clientWidth : 800;
+                const aspect = viewW / viewH;
+
+                const labelHeightOffset = 100;
+                const distanceX = ((actualWidth / 2) / Math.tan(fov / 2) / aspect) + labelHeightOffset;
+                const distanceZ = ((actualDepth / 2) / Math.tan(fov / 2)) + labelHeightOffset;
+                const distanceY = ((actualHeight / 2) / Math.tan(fov / 2)) + labelHeightOffset;
+                this.cameraDistance = Math.max(distanceX, distanceZ, distanceY) * 1.0;
+
+                const minDistance = 200;
+                const maxDistance = viewW * 2.5;
+                this.cameraDistance = Math.max(minDistance, Math.min(maxDistance, this.cameraDistance));
+
+                // 카메라 적용 + 렌더
+                if (this.cameraTarget) this.updateCameraToTarget();
+                this.renderTick(tickIndex, 0);
+                this.updateTimeDisplay();
+                this.renderEvents(tickData.game_time);
+
+                // 다음 프레임에 한 번 더 (초기 프레임 누락/깜빡임 방지)
+                requestAnimationFrame(() => {
+                    if (this.cameraTarget) this.updateCameraToTarget();
+                    this.renderTick(tickIndex, 0);
+                    this.updateTimeDisplay();
+                    this.renderEvents(tickData.game_time);
+                });
             }
 
-            // Kill Set 히트맵 및 조준 궤적 시각화
+            // Kill Set 조준 편차 시각화
             renderKillSetAimVisualization(container) {
                 if (!this.selectedKillSet) {
                     const msgDiv = document.createElement('div');
@@ -2463,13 +2846,13 @@
                 // 평평함 판정: 표준편차가 매우 작으면 거의 평평함
                 const isFlat = stdDeviation < 0.001 || coefficientOfVariation < 0.1;
 
-                // 시간별 조준 안정성 차트 섹션
+                // 시간에 따른 조준 오차(angular_error_theta) 차트 섹션
                 const stabilitySection = document.createElement('div');
                 stabilitySection.style.cssText = 'background: #1a1e2e; padding: 15px; border-radius: 8px; border: 1px solid #2a2f3e;';
                 
                 const stabilityTitle = document.createElement('div');
                 stabilityTitle.style.cssText = 'color: #ffffff; font-size: 14px; font-weight: bold; margin-bottom: 10px;';
-                stabilityTitle.textContent = '시간별 조준 안정성';
+                stabilityTitle.textContent = '시간에 따른 조준 오차 (angular_error_theta)';
                 stabilitySection.appendChild(stabilityTitle);
 
                 const stabilityCanvas = document.createElement('canvas');
@@ -2669,12 +3052,23 @@
                 legendDiv.appendChild(killLegend);
                 stabilitySection.appendChild(legendDiv);
 
-                // 설명 문구 추가
+                // 설명 문구 추가 (각도 오차 기반 계산 설명)
                 const descriptionDiv = document.createElement('div');
                 descriptionDiv.style.cssText = 'margin-top: 15px; padding: 10px; background: #0a0e15; border-radius: 4px; border-left: 3px solid #4a90e2;';
                 const descriptionText = document.createElement('div');
                 descriptionText.style.cssText = 'color: #8a8fa5; font-size: 12px; line-height: 1.6;';
-                descriptionText.innerHTML = '<strong style="color: #ffffff;">편차 계산 방법:</strong><br>요약: 각 틱의 조준점(aim_x, aim_y)과 첫 HIT 시점의 조준점(centerAimX, centerAimY) 사이의 2D 유클리드 거리를 계산합니다.';
+                descriptionText.innerHTML = `
+                    <div style="margin-bottom: 4px;"><strong style="color: #ffffff;">계산 방법 안내</strong></div>
+                    <div style="margin-bottom: 4px;">
+                        각 틱에서의 조준 방향과 해당 시점 타겟 방향 사이의 <strong>각도 오차(angular_error_theta)</strong>를 기반으로,
+                        조준 안정성 변화를 시계열로 표시합니다.
+                    </div>
+                    <div>
+                        보다 기술적으로는, 플레이어의 조준 방향 벡터(aim vector)와 타겟 위치를 기준으로 한 방향 벡터 사이의
+                        <strong>각도 오차(Angular Error)</strong> 변화 추이를 나타낸 값이며,
+                        이 각도 오차의 표준편차는 파이썬 전처리 단계에서 <code>angular_error_std_hit_kill</code>로 미리 계산됩니다.
+                    </div>
+                `;
                 descriptionDiv.appendChild(descriptionText);
                 stabilitySection.appendChild(descriptionDiv);
 
@@ -3396,13 +3790,24 @@
                 
                 // 선택된 이상 구간 저장
                 this.selectedAnomalySeq = seq;
+
+                // 다른 포커스/이벤트 선택 상태 정리 (anomaly에서는 SOURCE 중심 + 전체 플레이어 표시)
+                this.selectedEventForZoom = null;
+                this.selectedEvent = null;
+                this.selectedKillSet = null;
+                this.selectedHitToKillSequence = null;
                 
                 const startTickIndex = this.data.positions.findIndex(p => p.tick >= seq.startTick);
                 if (startTickIndex === -1) return;
                 
-                this.currentTick = startTickIndex;
-                this.renderTick(startTickIndex, 0);
-                this.updateTimeDisplay();
+                // 기본 이동 tick(카메라 프레이밍 기준): anchorTick이 있으면 anchor, 없으면 start
+                const baseTickIndex = (() => {
+                    const anchorTick = seq.anchorTick || seq.startTick;
+                    const idx = this.data.positions.findIndex(p => p.tick >= anchorTick);
+                    return idx !== -1 ? idx : startTickIndex;
+                })();
+
+                this.currentTick = baseTickIndex;
                 
                 // 포커스 범위 설정: 실제 이상 구간(startTick ~ endTick) 기준으로 padding 추가
                 const padding = 30; // 전후 30틱 추가
@@ -3449,6 +3854,73 @@
                         end: this.data.positions[endIdx].game_time
                     };
                 }
+
+                // 시점 이동 시 "딱 줌인된 채로 가운데" 오도록: focusPlayerId 위치로 카메라를 프레이밍
+                try {
+                    const focusName = this.focusPlayerId
+                        || (Array.isArray(seq.players) ? seq.players[0] : null)
+                        || (seq.players && typeof seq.players.values === 'function' ? Array.from(seq.players.values())[0] : null);
+
+                    const findPlayerPosAround = (centerIdx, playerName, radius = 60, minIdx = 0, maxIdx = this.data.positions.length - 1) => {
+                        if (!playerName) return null;
+                        for (let r = 0; r <= radius; r++) {
+                            const candidates = r === 0 ? [centerIdx] : [centerIdx - r, centerIdx + r];
+                            for (const idx of candidates) {
+                                if (idx < 0 || idx >= this.data.positions.length) continue;
+                                // 포커스 범위 밖으로 튀면 renderTick에서 전부 지워져 "표식이 안 보이는" 문제가 생김 → 범위 내로 제한
+                                if (idx < minIdx || idx > maxIdx) continue;
+                                const td = this.data.positions[idx];
+                                if (!td || !td.players) continue;
+                                const fp = td.players.find(p => p.name === playerName);
+                                if (fp && fp.position && fp.position[0] !== null && fp.position[0] !== undefined) {
+                                    return { idx, pos: fp.position };
+                                }
+                            }
+                        }
+                        return null;
+                    };
+
+                    // SOURCE(발사 플레이어)만 중앙에 오면 됨 → focusName 기준으로 주변 틱까지 탐색
+                    const minFocusIdx = this.focusTickRange?.startIdx ?? 0;
+                    const maxFocusIdx = this.focusTickRange?.endIdx ?? (this.data.positions.length - 1);
+                    // baseTickIndex도 범위 안으로 클램프
+                    const clampedBaseIdx = Math.max(minFocusIdx, Math.min(maxFocusIdx, baseTickIndex));
+                    const found = findPlayerPosAround(clampedBaseIdx, focusName, 80, minFocusIdx, maxFocusIdx);
+                    if (found && found.pos) {
+                        this.currentTick = found.idx;
+                        const pos = found.pos;
+                        const scaledX = (pos[0] - this.coordinateOffset.x) * this.coordinateScale;
+                        const scaledY = (pos[1] - this.coordinateOffset.y) * this.coordinateScale;
+                        const scaledZ = (pos[2] - this.coordinateOffset.z) * this.coordinateScale;
+
+                        // Three 좌표: (x, y, z) = (scaledX, scaledZ, scaledY)
+                        this.cameraTarget = { x: scaledX, y: scaledZ, z: scaledY };
+
+                        // 더 줌인: anomaly는 단일 SOURCE 중심이므로 더 가깝게
+                        const base = this.baseCameraDistance || 1000;
+                        this.cameraDistance = Math.max(150, Math.min(900, base * 0.45));
+
+                        this.cameraRotationX = 0.4;
+                        this.cameraRotationY = Math.PI / 4;
+
+                        if (this.panOffset) {
+                            this.panOffset.x = 0;
+                            this.panOffset.y = 0;
+                            this.panOffset.z = 0;
+                        }
+                        if (this.updateCameraToTarget) this.updateCameraToTarget();
+                    }
+                } catch (e) {
+                    console.warn('jumpToAnomalySeq camera framing failed:', e);
+                }
+
+                // 렌더링/시간 표시 갱신 (카메라 적용 후)
+                // currentTick이 포커스 범위 밖이면 플레이어가 전부 지워지므로 안전하게 클램프
+                if (this.focusMode && this.focusTickRange) {
+                    this.currentTick = Math.max(this.focusTickRange.startIdx, Math.min(this.focusTickRange.endIdx, this.currentTick));
+                }
+                this.renderTick(this.currentTick, 0);
+                this.updateTimeDisplay();
                 
                 // Aim Trace 탭 활성화 및 렌더링
                 const aimTabBtn = document.querySelector('.tab-btn[data-tab="aim"]');
@@ -4850,6 +5322,40 @@ Three.js · PapaParse · Pure JavaScript`
                                     playerJoinData.set(playerId, joinData);
                                 }
                                 
+                                // HIT–KILL SET 분석용 사전 계산 컬럼 (프론트에서 재계산 금지, 그대로 보존)
+                                const hitKillSetIdStr = row.hit_kill_set_id !== undefined && row.hit_kill_set_id !== null
+                                    ? String(row.hit_kill_set_id).trim()
+                                    : null;
+                                let hitKillSetId = null;
+                                if (hitKillSetIdStr && hitKillSetIdStr !== '' && hitKillSetIdStr.toLowerCase() !== 'nan') {
+                                    const parsedSetId = parseFloat(hitKillSetIdStr);
+                                    if (!Number.isNaN(parsedSetId)) {
+                                        hitKillSetId = parsedSetId;
+                                    }
+                                }
+
+                                const angularErrorThetaStr = row.angular_error_theta !== undefined && row.angular_error_theta !== null
+                                    ? String(row.angular_error_theta).trim()
+                                    : null;
+                                let angularErrorTheta = null;
+                                if (angularErrorThetaStr && angularErrorThetaStr !== '') {
+                                    const parsedTheta = parseFloat(angularErrorThetaStr);
+                                    if (!Number.isNaN(parsedTheta)) {
+                                        angularErrorTheta = parsedTheta;
+                                    }
+                                }
+
+                                const angularErrorStdStr = row.angular_error_std_hit_kill !== undefined && row.angular_error_std_hit_kill !== null
+                                    ? String(row.angular_error_std_hit_kill).trim()
+                                    : null;
+                                let angularErrorStd = null;
+                                if (angularErrorStdStr && angularErrorStdStr !== '') {
+                                    const parsedStd = parseFloat(angularErrorStdStr);
+                                    if (!Number.isNaN(parsedStd)) {
+                                        angularErrorStd = parsedStd;
+                                    }
+                                }
+                                
                                 tickData.players.push({
                                     name: playerId, // player_id를 name으로 사용
                                     team: joinData.team || '', // 조인된 팀 정보
@@ -4863,6 +5369,10 @@ Three.js · PapaParse · Pure JavaScript`
                                     aim_x: (aimX !== null && !Number.isNaN(aimX)) ? aimX : null,
                                     aim_y: (aimY !== null && !Number.isNaN(aimY)) ? aimY : null,
                                     aim_z: (aimZ !== null && !Number.isNaN(aimZ)) ? aimZ : null,
+                                    // HIT–KILL SET 사전 계산 결과 그대로 보존
+                                    hit_kill_set_id: hitKillSetId,
+                                    angular_error_theta: angularErrorTheta,
+                                    angular_error_std_hit_kill: angularErrorStd,
                                     // 나중에 조인될 정보들
                                     map: joinData.map || null,
                                     os: joinData.os || null,
@@ -5740,7 +6250,7 @@ Three.js · PapaParse · Pure JavaScript`
                     return;
                 }
                 
-                // Kill Set 선택 시 히트맵 및 조준 궤적 시각화
+                // Kill Set 선택 시 히트맵 및 조준 궤적 시각화 (우선 처리)
                 if (this.selectedKillSet && this.focusModeType === 'kill-set') {
                     this.renderKillSetAimVisualization(container);
                     return;
@@ -5748,15 +6258,41 @@ Three.js · PapaParse · Pure JavaScript`
 
                 // 이벤트별 시점 확인 기능 제거됨
 
-                // 주요 이벤트 시점 분석에서 선택된 이벤트의 ±30 tick 조준 궤적 표시
-                if (this.selectedEventForZoom) {
-                    console.log('renderAimTrace: selectedEventForZoom 발견, renderEventAimTrajectory 호출', {
+                // 주요 이벤트 시점 확인에서 선택된 이벤트의 aimtrace는 무조건 비활성화
+                // selectedEventForZoom이 있고 kill-set 모드가 아니면 무조건 비활성화
+                // 대신 3D 렌더링에서 source와 target이 명확히 표시됨
+                if (this.selectedEventForZoom && this.focusModeType !== 'kill-set') {
+                    console.log('renderAimTrace: selectedEventForZoom 발견, aimtrace 비활성화됨 (주요 이벤트 시점 확인 모드)', {
                         event: this.selectedEventForZoom,
-                        tick: this.selectedEventForZoom.tick
+                        tick: this.selectedEventForZoom.tick,
+                        focusModeType: this.focusModeType
                     });
-                    this.renderEventAimTrajectory(container);
+                    // aimtrace 대신 메시지 표시 (기존 내용 완전히 제거)
+                    container.innerHTML = '';
+                    const msgDiv = document.createElement('div');
+                    msgDiv.style.cssText = 'padding: 40px; text-align: center; color: #8a8fa5; font-size: 16px;';
+                    msgDiv.innerHTML = '주요 이벤트 시점 확인 모드입니다.<br>3D 렌더링에서 Source와 Target 플레이어를 확인하세요.';
+                    container.appendChild(msgDiv);
                     return;
                 } else {
+                    // Aim Trace를 표시할 수 있는 상태가 아닐 때 안내 메시지 표시
+                    if (!this.selectedAnomalySeq && !this.selectedKillSet && !this.selectedEventForZoom && !this.selectedHitToKillSequence) {
+                        const msgDiv = document.createElement('div');
+                        msgDiv.style.cssText = 'padding: 40px; text-align: center; color: #8a8fa5; font-size: 16px; line-height: 1.8;';
+                        msgDiv.innerHTML = `
+                            <div style="margin-bottom: 20px; color: #ffffff; font-weight: bold; font-size: 18px;">Aim Trace를 표시하려면:</div>
+                            <div style="text-align: left; max-width: 600px; margin: 0 auto;">
+                                <div style="margin-bottom: 10px;">1. "주요 이상 구간 분석"에서 이상 구간을 선택하고 "이동" 버튼을 클릭하세요.</div>
+                                <div style="margin-bottom: 10px;">또는</div>
+                                <div style="margin-bottom: 10px;">2. "HIT-KILL SET 분석"에서 Kill Set을 선택하세요.</div>
+                                <div style="margin-bottom: 10px;">또는</div>
+                                <div>3. "주요 이벤트 시점 확인"에서 이벤트를 선택하세요.</div>
+                            </div>
+                        `;
+                        container.appendChild(msgDiv);
+                        return;
+                    }
+                    
                     console.log('renderAimTrace: selectedEventForZoom 없음', {
                         selectedEventForZoom: this.selectedEventForZoom,
                         selectedAnomalySeq: this.selectedAnomalySeq,
@@ -5771,14 +6307,7 @@ Three.js · PapaParse · Pure JavaScript`
                     return;
                 }
                 
-                // 포커스 모드이지만 선택된 항목이 없을 때 메시지 표시
-                if (!this.selectedAnomalySeq && !this.selectedKillSet && !this.selectedHitToKillSequence) {
-                    const msgDiv = document.createElement('div');
-                    msgDiv.style.cssText = 'padding: 40px; text-align: center; color: #8a8fa5; font-size: 16px;';
-                    msgDiv.innerHTML = 'Aim Trace를 표시하려면:<br>1. "주요 이상 구간 분석"에서 이상 구간을 선택하고 "이동" 버튼을 클릭하세요.<br>또는<br>2. "HIT-KILL SET 분석"에서 Kill Set을 선택하세요.<br>또는<br>3. "주요 이벤트 시점 분석"에서 이벤트를 선택하세요.';
-                    container.appendChild(msgDiv);
-                    return;
-                }
+                // 포커스 모드이지만 선택된 항목이 없을 때는 이미 위에서 메시지 표시됨 (중복 제거)
                 
                 // 기존 방식 (KILL 이벤트 선택 시)
                 const canvas = document.createElement('canvas');
@@ -6981,13 +7510,13 @@ Three.js · PapaParse · Pure JavaScript`
 
                 vizContainer.appendChild(heatmapSection);
 
-                // 2. 시간별 조준 안정성 차트
+                // 2. 시간에 따른 조준 오차(angular_error_theta) 차트
                 const stabilitySection = document.createElement('div');
                 stabilitySection.style.cssText = 'background: #1a1e2e; padding: 15px; border-radius: 8px; border: 1px solid #2a2f3e;';
                 
                 const stabilityTitle = document.createElement('div');
                 stabilityTitle.style.cssText = 'color: #ffffff; font-size: 14px; font-weight: bold; margin-bottom: 10px;';
-                stabilityTitle.textContent = '시간별 조준 안정성';
+                stabilityTitle.textContent = '시간에 따른 조준 오차 (angular_error_theta)';
                 stabilitySection.appendChild(stabilityTitle);
 
                 const stabilityCanvas = document.createElement('canvas');
@@ -8788,33 +9317,9 @@ Three.js · PapaParse · Pure JavaScript`
                             let newPanY = 0;
                             let newPanZ = 0;
                             
-                            // 플레이어 경로 범위 내로 제한
-                            if (this.mapBounds && this.mapBounds.pathMinZ !== undefined) {
-                                const bounds = this.mapBounds;
-                                
-                                // 경로 경계 내로 제한 (약간의 여유 공간 포함)
-                                const margin = Math.max(
-                                    bounds.pathWidth || bounds.width || 0,
-                                    bounds.pathHeight || bounds.height || 0,
-                                    bounds.pathDepth || bounds.depth || 0
-                                ) * 0.1;
-                                
-                                // Y축(높이) 경계 체크
-                                const minY = bounds.pathMinZ - margin;
-                                const maxY = bounds.pathMaxZ + margin;
-                                newTargetY = Math.max(minY, Math.min(maxY, newTargetY));
-                                
-                                // X, Z축 경계 체크 (좌우 이동 시)
-                                if (isHorizontalMove) {
-                                    const minX = (bounds.pathMinX !== undefined ? bounds.pathMinX : bounds.minX) - margin;
-                                    const maxX = (bounds.pathMaxX !== undefined ? bounds.pathMaxX : bounds.maxX) + margin;
-                                    const minZ = (bounds.pathMinY !== undefined ? bounds.pathMinY : bounds.minY) - margin;
-                                    const maxZ = (bounds.pathMaxY !== undefined ? bounds.pathMaxY : bounds.maxY) + margin;
-                                    
-                                    newTargetX = Math.max(minX, Math.min(maxX, newTargetX));
-                                    newTargetZ = Math.max(minZ, Math.min(maxZ, newTargetZ));
-                                }
-                            }
+                            // NOTE: SHIFT 패닝 제한 해제
+                            // 기존에는 플레이어 경로 범위(mapBounds)로 cameraTarget을 clamp해서
+                            // 특정 구간에서 패닝이 "막히는" 문제가 있었음. 사용자 요청에 따라 제한을 제거한다.
                             
                             // 카메라 타겟 업데이트
                             this.cameraTarget.x = newTargetX;
@@ -8886,7 +9391,8 @@ Three.js · PapaParse · Pure JavaScript`
                     
                     // 줌 방향: deltaY > 0이면 아래로 스크롤 (축소), deltaY < 0이면 위로 스크롤 (확대)
                     // deltaY를 더 세밀하게 처리 (기본적으로 100 단위이므로 더 작은 단위로 변환)
-                    const normalizedDelta = e.deltaY * 0.01; // 100 -> 1로 정규화
+                    // 트랙패드/휠 제스처에서 줌 변화가 너무 작다는 피드백에 따라 범위를 확대
+                    const normalizedDelta = e.deltaY * 0.03; // 기존 대비 3배
                     const zoomDelta = normalizedDelta * zoomSpeed;
                     this.cameraDistance += zoomDelta;
                     
@@ -10123,7 +10629,9 @@ Three.js · PapaParse · Pure JavaScript`
                     victim_name: event.victim?.name
                 });
                 
-                if (primaryPlayer && primaryPlayer.position && primaryPlayer.position[0] !== null) {
+                // 주요 이벤트 시점 확인 모드(selectedEventForZoom)에서는 카메라 설정을 건너뛰기
+                // jumpToEventWithZoom에서 이미 카메라를 설정했으므로 덮어쓰지 않음
+                if (!this.selectedEventForZoom && primaryPlayer && primaryPlayer.position && primaryPlayer.position[0] !== null) {
                     // 스케일링된 좌표 사용
                     const primaryPos = {
                         x: (primaryPlayer.position[0] - this.coordinateOffset.x) * this.coordinateScale,
@@ -10186,39 +10694,11 @@ Three.js · PapaParse · Pure JavaScript`
                     // 카메라 업데이트 (렌더링 전에 먼저 업데이트하여 검은 화면 방지)
                     console.log('Camera target set to:', this.cameraTarget, 'distance:', this.cameraDistance);
                     this.updateCameraToTarget();
-                    
-                    // 카메라가 제대로 설정되었는지 확인하고 렌더링
-                    // 카메라 타겟이 설정되었으면 렌더링 수행
-                    if (this.cameraTarget) {
-                        // 렌더링 수행 (카메라 업데이트 후)
-                        if (targetTick !== -1 && targetTick >= 0 && targetTick < this.data.positions.length) {
-                            // 현재 틱을 확실히 설정
-                            this.currentTick = targetTick;
-                            
-                            // playheadTime도 이벤트 시간으로 설정
-                            this.playheadTime = event.game_time;
-                            this.lastFrameTime = Date.now();
-                            
-                            // 즉시 렌더링 수행 (보간 없이 해당 틱으로 바로 이동)
-                            this.renderTick(this.currentTick, 0);
-                            this.updateTimeDisplay();
-                            
-                            // 이벤트 렌더링 (hit과 kill 이벤트 시각화)
-                            const eventGameTime = event.game_time;
-                            this.renderEvents(eventGameTime);
-                            
-                            console.log('selectEvent: 렌더링 완료', {
-                                event_type: event.event_type,
-                                targetTick: targetTick,
-                                currentTick: this.currentTick,
-                                cameraTarget: this.cameraTarget
-                            });
-                        } else {
-                            console.warn('selectEvent: Invalid targetTick:', targetTick, 'positions length:', this.data.positions.length);
-                        }
-                    } else {
-                        console.error('Camera target not set, cannot render');
-                    }
+                } else if (this.selectedEventForZoom) {
+                    // 주요 이벤트 시점 확인 모드에서는 카메라 설정과 렌더링을 모두 건너뜀
+                    // jumpToEventWithZoom에서 이미 카메라 설정과 렌더링을 수행했으므로 중복 방지
+                    console.log('selectEvent: selectedEventForZoom 모드이므로 카메라 설정 및 렌더링 건너뜀 (jumpToEventWithZoom에서 처리됨)');
+                    return; // 렌더링을 하지 않고 종료
                 } else {
                     console.warn('Primary player position is null, using fallback camera');
                     // mapBounds가 없거나 플레이어 위치가 없을 때 기본 카메라 설정
@@ -10717,17 +11197,19 @@ Three.js · PapaParse · Pure JavaScript`
                 // 플레이어 렌더링
                 // 포커스 모드에서 victim이 tickData.players에 없을 수 있으므로, event.victim을 강제로 추가
                 const playersToRender = [...tickData.players];
-                if (this.focusMode && this.selectedEvent && this.selectedEvent.victim) {
-                    const victimName = this.selectedEvent.victim.name;
+                // selectedEventForZoom 또는 selectedEvent에서 victim 확인
+                const eventToCheck = this.selectedEventForZoom || this.selectedEvent;
+                if (this.focusMode && eventToCheck && eventToCheck.victim) {
+                    const victimName = eventToCheck.victim.name;
                     const victimInPlayers = playersToRender.find(p => p.name === victimName);
                     // victim이 players에 없고, event.victim에 position이 있으면 강제로 추가
-                    if (!victimInPlayers && this.selectedEvent.victim.position && this.selectedEvent.victim.position[0] !== null) {
+                    if (!victimInPlayers && eventToCheck.victim.position && eventToCheck.victim.position[0] !== null) {
                         // event.victim 정보를 사용하여 가상의 플레이어 객체 생성
                         const virtualVictim = {
                             name: victimName,
-                            position: this.selectedEvent.victim.position,
-                            team: this.selectedEvent.victim.team || 'T',
-                            weapon: this.selectedEvent.victim.weapon,
+                            position: eventToCheck.victim.position,
+                            team: eventToCheck.victim.team || 'T',
+                            weapon: eventToCheck.victim.weapon,
                             health: 0 // 사망 상태로 표시하되 렌더링은 함
                         };
                         playersToRender.push(virtualVictim);
@@ -10740,8 +11222,11 @@ Three.js · PapaParse · Pure JavaScript`
                     // 사망한 플레이어는 시뮬레이션에서 제외 (렌더링 및 라벨 비표시)
                     // 단, 포커스 모드에서 victim은 강제로 표시
                     const isDead = player.health !== null && player.health <= 0;
-                    const isForcedVictim = (this.focusMode && this.selectedEvent && this.selectedEvent.victim && this.selectedEvent.victim.name === player.name);
-                    if (isDead && !isForcedVictim) {
+                    const eventForVictim = this.selectedEventForZoom || this.selectedEvent;
+                    const isForcedVictim = (this.focusMode && eventForVictim && eventForVictim.victim && eventForVictim.victim.name === player.name);
+                    // anomaly 모드에서는 SOURCE(=focusPlayerId) 표식이 반드시 보여야 함
+                    const isAnomalySource = (this.focusMode && this.focusModeType === 'anomaly' && this.focusPlayerId && player.name === this.focusPlayerId);
+                    if (isDead && !isForcedVictim && !isAnomalySource) {
                         continue;
                     }
                     
@@ -10767,16 +11252,30 @@ Three.js · PapaParse · Pure JavaScript`
                     let color = baseColor;
                     let opacity = 1.0;
                     let isFocusedPlayer = false;
+                    const isEventZoomMode = !!this.selectedEventForZoom;
                     
-                    if (this.focusMode && this.selectedEvent) {
-                        const isAttacker = this.selectedEvent.attacker && this.selectedEvent.attacker.name === player.name;
-                        const isVictim = this.selectedEvent.victim && this.selectedEvent.victim.name === player.name;
+                    // selectedEvent 또는 selectedEventForZoom에서 source/target 확인
+                    const eventToCheck = this.selectedEventForZoom || this.selectedEvent;
+                    if (this.focusMode && eventToCheck) {
+                        const isAttacker = eventToCheck.attacker && eventToCheck.attacker.name === player.name;
+                        const isVictim = eventToCheck.victim && eventToCheck.victim.name === player.name;
                         isFocusedPlayer = isAttacker || isVictim;
                         
                         if (!isFocusedPlayer) {
-                            // 관련 없는 플레이어: 회색으로 변경하고 투명도 낮춤
+                            // 관련 없는 플레이어: 주요 이벤트 시점 확인 모드에서는 더 잘 보이도록
+                            if (isEventZoomMode) {
+                                // 전체 관계도를 보기 위해 투명도를 높임
+                                color = 0x888888; // 밝은 회색
+                                opacity = 0.6; // 투명도 60% (더 잘 보이도록)
+                            } else {
+                                // 다른 포커스 모드에서는 기존대로
                             color = 0x666666; // 회색
                             opacity = 0.3; // 투명도 30%
+                            }
+                        } else if (isEventZoomMode) {
+                            // 주요 이벤트 시점 확인 모드에서는 source/target을 더 밝게
+                            color = isAttacker ? 0x00ff00 : 0xff0000; // source는 초록색, target은 빨간색
+                            opacity = 1.0;
                         }
                     }
                     
@@ -10786,7 +11285,9 @@ Three.js · PapaParse · Pure JavaScript`
                     // 정규화된 크기 사용 (더 일관된 크기)
                     const normalizedMapSize = this.mapBounds?.normalizedWidth || mapSize;
                     // 플레이어 크기 조정 (가시성 향상)
-                    const playerScale = Math.max(0.25, Math.min(0.6, normalizedMapSize / 5000)); // 크기 증가
+                    // 주요 이벤트 시점 확인 모드에서는 source/target을 더 크게 표시
+                    const sizeMultiplier = (isEventZoomMode && isFocusedPlayer) ? 1.8 : 1.0;
+                    const playerScale = Math.max(0.25, Math.min(0.6, normalizedMapSize / 5000)) * sizeMultiplier; // 크기 증가
                     const baseSize = 5 * playerScale; // 기본 크기 증가
                     let geometry;
                     if (isCT) {
@@ -10798,8 +11299,8 @@ Three.js · PapaParse · Pure JavaScript`
                     
                     const material = new THREE.MeshPhongMaterial({ 
                         color: color,
-                        emissive: isFocusedPlayer ? baseColor : 0x333333,
-                        emissiveIntensity: isFocusedPlayer ? 0.4 : 0.1,
+                        emissive: isFocusedPlayer ? (isEventZoomMode ? color : baseColor) : 0x333333,
+                        emissiveIntensity: isFocusedPlayer ? (isEventZoomMode ? 0.8 : 0.4) : 0.1, // 주요 이벤트 시점 확인 모드에서는 더 밝게
                         transparent: opacity < 1.0,
                         opacity: opacity
                     });
@@ -10906,7 +11407,10 @@ Three.js · PapaParse · Pure JavaScript`
                     ctx.textBaseline = 'top';
                     
                     // 포커스 모드에서 관련 없는 플레이어 라벨도 투명 처리
-                    const labelOpacity = (this.focusMode && this.selectedEvent && !isFocusedPlayer) ? 0.3 : 1.0;
+                    const eventToCheckForLabel = this.selectedEventForZoom || this.selectedEvent;
+                    const labelOpacity = (this.focusMode && eventToCheckForLabel && !isFocusedPlayer) 
+                        ? (this.selectedEventForZoom ? 0.6 : 0.3)  // 주요 이벤트 시점 확인 모드에서는 더 잘 보이도록
+                        : 1.0;
                     
                     // 깔끔한 반투명 박스 배경
                     ctx.fillStyle = `rgba(0, 0, 0, ${0.8 * labelOpacity})`;
@@ -11614,6 +12118,20 @@ Three.js · PapaParse · Pure JavaScript`
                 if (!this.data || !this.data.events) return;
                 if (gameTime === null || gameTime === undefined) return;
 
+                // 관계도(포커스) 모드에서 링/라벨이 플레이어 표식과 정확히 겹치도록,
+                // "현재 렌더링 중인 틱"의 player 좌표로 스냅할 수 있게 tickData를 준비한다.
+                let snapTickIndex = -1;
+                if (typeof this.currentTick === 'number' && this.currentTick >= 0 && this.currentTick < this.data.positions.length) {
+                    const ct = this.data.positions[this.currentTick];
+                    if (ct && typeof ct.game_time === 'number' && Math.abs(ct.game_time - gameTime) < 0.05) {
+                        snapTickIndex = this.currentTick;
+                    }
+                }
+                if (snapTickIndex === -1) {
+                    snapTickIndex = this.findTickByTime ? this.findTickByTime(gameTime) : -1;
+                }
+                const snapTickData = (snapTickIndex !== -1) ? this.data.positions[snapTickIndex] : null;
+
                 this.data.events.forEach(event => {
                     // 디버깅: 60587 플레이어 이벤트만 로그
                     if (event.attacker?.name === '60587' || event.victim?.name === '60587') {
@@ -11677,23 +12195,18 @@ Three.js · PapaParse · Pure JavaScript`
                     }
                     let timeDiff = Math.abs(event.game_time - gameTime);
                     // 정확히 해당 틱에만 표시 (0.05초 이내, 약 3틱)
-                    // 포커스 모드일 때는 선택된 이벤트만 표시
+                    // 포커스 모드(주요 이벤트 시점 확인/event-zoom, HIT-KILL SET/kill-set)에서는
+                    // "관계도 기준 이벤트"만 정확히 일치하는 경우에만 표시하도록 공통 처리한다.
+                    const relationEvent = this.selectedEventForZoom || (this.focusModeType === 'kill-set' ? this.selectedEvent : this.selectedEvent);
                     let timeMatch = false;
-                    if (this.focusMode && this.selectedEvent) {
-                        // 포커스 모드: 선택된 이벤트와 정확히 일치하는 경우만 표시
-                        // game_time을 우선적으로 확인하고, tick도 확인 (tick이 없을 수 있으므로)
-                        timeMatch = Math.abs(event.game_time - this.selectedEvent.game_time) < 0.01;
-                        const tickMatch = (this.selectedEvent.tick === undefined || event.tick === undefined) 
-                            ? true  // tick 정보가 없으면 timeMatch만 확인
-                            : (event.tick === this.selectedEvent.tick);
-                        
-                        // game_time이 일치하면 표시 (tick은 보조 확인)
-                        if (!timeMatch) {
-                            return; // 선택된 이벤트가 아니면 스킵
-                        }
+                    if (this.focusMode && relationEvent) {
+                        timeMatch = Math.abs(event.game_time - relationEvent.game_time) < 0.01;
+                        const tickMatch = (relationEvent.tick === undefined || event.tick === undefined)
+                            ? true
+                            : (event.tick === relationEvent.tick);
+                        if (!timeMatch) return;
                         // timeMatch가 true이면 tickMatch와 관계없이 표시 (tick 정보가 부정확할 수 있음)
-                        // 포커스 모드에서 선택된 이벤트는 timeDiff 조건 무시하고 표시
-                        timeDiff = 0; // 강제로 조건 통과
+                        timeDiff = 0;
                     }
                     
                     // kill/hit 이벤트 표시
@@ -11703,30 +12216,59 @@ Three.js · PapaParse · Pure JavaScript`
                     
                     // 포커스 모드일 때는 timeDiff 조건을 완화 (선택된 이벤트는 확실히 표시)
                     // 포커스 모드에서 선택된 이벤트는 timeDiff 조건 완전히 무시
-                    const shouldShow = (this.focusMode && this.selectedEvent && timeMatch) 
+                    // 관계도 렌더링: event-zoom 또는 kill-set 모드에서 관계도 기준 이벤트는 무조건 표시
+                    const isRelationMode = !!this.selectedEventForZoom || (this.focusModeType === 'kill-set' && !!this.selectedKillSet);
+                    const shouldShow = (this.focusMode && isRelationMode && timeMatch)
                         ? true  // 포커스 모드에서 선택된 이벤트는 무조건 표시
                         : (timeDiff < 0.05);  // 일반 모드는 기존 조건 유지
                     
                     // kill/hit 이벤트만 표시
                     if (!isEventToShow) return;
                     
-                    if (shouldShow && event.attacker && event.attacker.position && event.attacker.position[0] !== null) {
-                        // 스케일링된 좌표 사용
-                        const attackerScaledX = (event.attacker.position[0] - this.coordinateOffset.x) * this.coordinateScale;
-                        const attackerScaledY = (event.attacker.position[1] - this.coordinateOffset.y) * this.coordinateScale;
-                        const attackerScaledZ = (event.attacker.position[2] - this.coordinateOffset.z) * this.coordinateScale;
+                    if (shouldShow && event.attacker && event.attacker.name) {
+                        // 관계도 모드에서는 event position 대신 현재 틱의 player position을 우선 사용(정렬/보간 차이로 인한 링 오프셋 방지)
+                        let attackerPosArr = event.attacker.position;
+                        if (this.focusMode && timeMatch && snapTickData && snapTickData.players) {
+                            const attackerInTick = snapTickData.players.find(p => p.name === event.attacker.name);
+                            if (attackerInTick && attackerInTick.position && attackerInTick.position[0] !== null) {
+                                attackerPosArr = attackerInTick.position;
+                            }
+                        }
+                        if (!attackerPosArr || attackerPosArr[0] === null || attackerPosArr[0] === undefined) return;
+
+                        // 스케일링된 좌표 사용 (renderTick과 동일한 축 매핑)
+                        const attackerScaledX = (attackerPosArr[0] - this.coordinateOffset.x) * this.coordinateScale;
+                        const attackerScaledY = (attackerPosArr[1] - this.coordinateOffset.y) * this.coordinateScale;
+                        const attackerScaledZ = (attackerPosArr[2] - this.coordinateOffset.z) * this.coordinateScale;
                         
                         // kill/hit 이벤트일 때 공격자 플레이어를 원 테두리로 감싸기
-                        // 플레이어 크기에 맞춰 링 반지름 동적으로 조정
+                        // 플레이어 표식(삼각형/구체)에 정확히 맞춰서 원형 링 배치
                         if (isKillEvent || isHitEvent) {
-                        const mapSizeForRing = this.mapBounds ? Math.max(this.mapBounds.width, this.mapBounds.depth, this.mapBounds.height) : 1000;
-                        const normalizedMapSizeForRing = this.mapBounds?.normalizedWidth || mapSizeForRing;
-                        const playerScaleForRing = Math.max(0.25, Math.min(0.6, normalizedMapSizeForRing / 5000));
-                        const baseSizeForRing = 5 * playerScaleForRing;
-                        const innerRadius = baseSizeForRing * 2.0;
-                        const outerRadius = baseSizeForRing * 2.4;
+                        const attackerIsCT = event.attacker.team === 'CT';
+                        const mapSizeForAttackerRing = this.mapBounds ? Math.max(this.mapBounds.width, this.mapBounds.depth, this.mapBounds.height) : 1000;
+                        const normalizedMapSizeForAttackerRing = this.mapBounds?.normalizedWidth || mapSizeForAttackerRing;
+                        // renderTick과 동일한 플레이어 크기 계산 사용 (sizeMultiplier 포함)
+                        // 링은 "플레이어 표식"을 둘러싸도록, renderTick의 표식 크기 규칙과 동일하게 맞춘다.
+                        // renderTick에서는 event-zoom(주요 이벤트 시점 확인)에서만 source/target을 키우고,
+                        // kill-set(HIT-KILL SET 분석)에서는 기본 크기를 유지한다.
+                        const isEventZoomMode = !!this.selectedEventForZoom;
+                        const sizeMultiplier = isEventZoomMode ? 1.8 : 1.0;
+                        const playerScaleForAttackerRing = Math.max(0.25, Math.min(0.6, normalizedMapSizeForAttackerRing / 5000)) * sizeMultiplier;
+                        const baseSizeForAttackerRing = 5 * playerScaleForAttackerRing; // renderTick과 동일한 baseSize 계산 (sizeMultiplier 포함)
+                        
+                        // 원형 링 반지름: 플레이어 모델의 실제 반지름(baseSize)에 맞춤
+                        // 링은 플레이어 표식의 바닥을 둘러싸므로, 플레이어 모델의 반지름과 동일하게 설정
+                        const ringRadius = baseSizeForAttackerRing; // 플레이어 모델의 반지름과 동일
+                        const ringThickness = baseSizeForAttackerRing * 0.2; // 링 두께 (반지름의 20%)
+                        const innerRadius = ringRadius - ringThickness / 2;
+                        const outerRadius = ringRadius + ringThickness / 2;
 
                         // 공격자: 빨간 링 (attacker 박스 색상과 동일: rgba(255, 77, 79))
+                        // 링은 표식(구/삼각형)과 "같은 평면"에 둬야 화면에서 정확히 표식을 둘러싼다.
+                        // 바닥(ground-plane)에 깔면 카메라 각도에 따라 시차가 생겨 중심이 밀려 보일 수 있음.
+                        // 따라서 표식 메쉬의 position.y(=scaledZ)와 동일하게 맞춘다.
+                        const attackerRingY = attackerScaledZ;
+                        
                         const attackerRing = new THREE.Mesh(
                             new THREE.RingGeometry(innerRadius, outerRadius, 32),
                             new THREE.MeshPhongMaterial({ 
@@ -11738,10 +12280,10 @@ Three.js · PapaParse · Pure JavaScript`
                         );
                         attackerRing.position.set(
                             attackerScaledX,
-                            attackerScaledZ, // Three.js Y축
+                            attackerRingY, // 플레이어 모델의 바닥 높이
                             attackerScaledY  // Three.js Z축
                         );
-                        attackerRing.rotation.x = -Math.PI / 2;
+                        attackerRing.rotation.x = -Math.PI / 2; // 바닥에 평행하게
                         this.scene.add(attackerRing);
                         this.eventMarkers.push(attackerRing);
                         }
@@ -11758,18 +12300,38 @@ Three.js · PapaParse · Pure JavaScript`
                             victim_position_valid: event.victim?.position?.[0] !== null && event.victim?.position?.[0] !== undefined
                         });
                         
-                        if ((isKillEvent || isHitEvent) && event.victim && event.victim.position && event.victim.position[0] !== null) {
-                            const victimScaledX = (event.victim.position[0] - this.coordinateOffset.x) * this.coordinateScale;
-                            const victimScaledY = (event.victim.position[1] - this.coordinateOffset.y) * this.coordinateScale;
-                            const victimScaledZ = (event.victim.position[2] - this.coordinateOffset.z) * this.coordinateScale;
+                        if ((isKillEvent || isHitEvent) && event.victim && event.victim.name) {
+                            let victimPosArr = event.victim.position;
+                            if (this.focusMode && timeMatch && snapTickData && snapTickData.players) {
+                                const victimInTick = snapTickData.players.find(p => p.name === event.victim.name);
+                                if (victimInTick && victimInTick.position && victimInTick.position[0] !== null) {
+                                    victimPosArr = victimInTick.position;
+                                }
+                            }
+                            if (!victimPosArr || victimPosArr[0] === null || victimPosArr[0] === undefined) return;
+
+                            const victimScaledX = (victimPosArr[0] - this.coordinateOffset.x) * this.coordinateScale;
+                            const victimScaledY = (victimPosArr[1] - this.coordinateOffset.y) * this.coordinateScale;
+                            const victimScaledZ = (victimPosArr[2] - this.coordinateOffset.z) * this.coordinateScale;
                             
                             // 피격자 링 추가 (kill: 노란색, hit: 주황색)
-                            const mapSizeForRing = this.mapBounds ? Math.max(this.mapBounds.width, this.mapBounds.depth, this.mapBounds.height) : 1000;
-                            const normalizedMapSizeForRing = this.mapBounds?.normalizedWidth || mapSizeForRing;
-                            const playerScaleForRing = Math.max(0.25, Math.min(0.6, normalizedMapSizeForRing / 5000));
-                            const baseSizeForRing = 5 * playerScaleForRing;
-                            const innerRadius = baseSizeForRing * 2.0;
-                            const outerRadius = baseSizeForRing * 2.4;
+                            // 플레이어 표식(삼각형/구체)에 정확히 맞춰서 원형 링 배치
+                            const victimIsCT = event.victim.team === 'CT';
+                            const mapSizeForVictimRing = this.mapBounds ? Math.max(this.mapBounds.width, this.mapBounds.depth, this.mapBounds.height) : 1000;
+                            const normalizedMapSizeForVictimRing = this.mapBounds?.normalizedWidth || mapSizeForVictimRing;
+                            // 링은 "플레이어 표식"을 둘러싸도록, renderTick의 표식 크기 규칙과 동일하게 맞춘다.
+                            const isEventZoomMode = !!this.selectedEventForZoom;
+                            const sizeMultiplier = isEventZoomMode ? 1.8 : 1.0;
+                            const playerScaleForVictimRing = Math.max(0.25, Math.min(0.6, normalizedMapSizeForVictimRing / 5000)) * sizeMultiplier;
+                            const baseSizeForVictimRing = 5 * playerScaleForVictimRing; // renderTick과 동일한 baseSize 계산 (sizeMultiplier 포함)
+                            
+                            // 원형 링 반지름: 플레이어 모델의 실제 반지름(baseSize)에 맞춤
+                            // 링은 플레이어 표식의 바닥을 둘러싸므로, 플레이어 모델의 반지름과 동일하게 설정
+                            const ringRadius = baseSizeForVictimRing; // 플레이어 모델의 반지름과 동일
+                            const ringThickness = baseSizeForVictimRing * 0.2; // 링 두께 (반지름의 20%)
+                            const innerRadius = ringRadius - ringThickness / 2;
+                            const outerRadius = ringRadius + ringThickness / 2;
+                            
                             // kill: 노란색, hit: 주황색
                             const victimRingColor = isKillEvent ? 0xffd93d : 0xffa500;
                             const victimRing = new THREE.Mesh(
@@ -11781,52 +12343,55 @@ Three.js · PapaParse · Pure JavaScript`
                                     side: THREE.DoubleSide
                                 })
                             );
+                            
+                            // attacker와 victim의 team 정보 확인 (라벨 위치 계산용)
+                            const attackerIsCT = event.attacker.team === 'CT';
+                            
+                            // attacker의 baseSize도 계산 (라벨 위치 계산용)
+                            const mapSizeForAttackerLabel = this.mapBounds ? Math.max(this.mapBounds.width, this.mapBounds.depth, this.mapBounds.height) : 1000;
+                            const normalizedMapSizeForAttackerLabel = this.mapBounds?.normalizedWidth || mapSizeForAttackerLabel;
+                            const isEventZoomModeForAttacker = !!this.selectedEventForZoom;
+                            const isKillSetModeForAttacker = this.focusModeType === 'kill-set';
+                            // 주요 이벤트 시점 확인 모드 또는 HIT-KILL SET 분석 모드에서 sizeMultiplier 적용
+                            const sizeMultiplierForAttacker = ((isEventZoomModeForAttacker || isKillSetModeForAttacker) && true) ? 1.8 : 1.0; // attacker이므로 항상 true
+                            const playerScaleForAttackerLabel = Math.max(0.25, Math.min(0.6, normalizedMapSizeForAttackerLabel / 5000)) * sizeMultiplierForAttacker;
+                            const baseSizeForAttackerLabel = 5 * playerScaleForAttackerLabel;
+                            
+                            // CT는 구체(중심 = scaledZ), T는 원뿔(중심 = scaledZ + baseSize, 원뿔 높이는 baseSize * 2이므로 중심은 baseSize)
+                            const attackerCenterY = attackerIsCT ? attackerScaledZ : attackerScaledZ + baseSizeForAttackerLabel;
+                            const victimCenterY = victimIsCT ? victimScaledZ : victimScaledZ + baseSizeForVictimRing;
+                            
+                            // 링은 표식(구/삼각형)과 같은 평면에 둬야 화면에서 정확히 둘러싼다.
+                            const victimRingY = victimScaledZ;
+                            
                             victimRing.position.set(
                                 victimScaledX,
-                                victimScaledZ, // Three.js Y축
+                                victimRingY, // 플레이어 모델의 바닥 높이
                                 victimScaledY  // Three.js Z축
                             );
                             victimRing.rotation.x = -Math.PI / 2;
                             this.scene.add(victimRing);
                             this.eventMarkers.push(victimRing);
                             
-                            // 플레이어 모델의 실제 중앙 높이 계산
-                            const mapSize = this.mapBounds ? Math.max(this.mapBounds.width, this.mapBounds.depth, this.mapBounds.height) : 1000;
-                            const normalizedMapSize = this.mapBounds?.normalizedWidth || mapSize;
-                            const playerScale = Math.max(0.15, Math.min(0.4, normalizedMapSize / 5000));
-                            const baseSize = 3.5 * playerScale;
-                            
-                            // attacker와 victim의 team 정보 확인하여 모델 중앙 높이 계산
-                            const attackerIsCT = event.attacker.team === 'CT';
-                            const victimIsCT = event.victim.team === 'CT';
-                            
-                            // CT는 구체(중심 = scaledZ), T는 원뿔(중심 = scaledZ + baseSize)
-                            const attackerCenterY = attackerIsCT ? attackerScaledZ : attackerScaledZ + baseSize;
-                            const victimCenterY = victimIsCT ? victimScaledZ : victimScaledZ + baseSize;
-                            
-                            // 상단 라벨 위치 (두 플레이어의 중간 지점 위에 같은 높이로 수평 배치)
-                            // 플레이어 정보 박스 위에 자연스럽게 배치되도록 조정
+                            // 관계도 UI: 각 플레이어 위에 바로 배치된 라벨 구조
                             const maxPlayerHeight = Math.max(
-                                attackerIsCT ? baseSize : (baseSize * 2),
-                                victimIsCT ? baseSize : (baseSize * 2)
+                                attackerIsCT ? baseSizeForAttackerLabel : (baseSizeForAttackerLabel * 2),
+                                victimIsCT ? baseSizeForVictimRing : (baseSizeForVictimRing * 2)
                             );
                             const playerInfoBoxHeight = 10; // 플레이어 정보 박스 높이 (스프라이트 크기)
                             const LABEL_Y_OFFSET = maxPlayerHeight * 0.5 + playerInfoBoxHeight + 25; // 플레이어 표식 위 + 정보 박스 + 여유 공간
-                            const midX = (attackerScaledX + victimScaledX) / 2;
-                            const midZ = (attackerScaledZ + victimScaledZ) / 2;
-                            const midY = (attackerScaledY + victimScaledY) / 2;
-                            const labelHeight = Math.max(attackerScaledZ, victimScaledZ) + LABEL_Y_OFFSET;
                             
-                            // ATTACKER 박스는 왼쪽, DEAD 박스는 오른쪽에 배치
-                            const labelSpacing = 80; // 두 박스 사이 간격
-                            const attackerLabelX = midX - labelSpacing / 2;
-                            const victimLabelX = midX + labelSpacing / 2;
-                            const attackerLabelTopY = labelHeight;
-                            const victimLabelTopY = labelHeight;
+                            // 각 플레이어 위에 바로 배치
+                            const attackerLabelX = attackerScaledX; // Attacker 라벨은 attacker 위에
+                            const attackerLabelTopY = attackerCenterY + LABEL_Y_OFFSET;
+                            const victimLabelX = victimScaledX; // Victim 라벨은 victim 위에
+                            const victimLabelTopY = victimCenterY + LABEL_Y_OFFSET;
+                            const midY = (attackerScaledY + victimScaledY) / 2; // Z축 중간값 (연결선용)
                             
                             // Attacker 라벨 생성 (victim이 있을 때만, 수평 배치를 위해)
                             // 포커스 모드에서 선택된 이벤트는 timeDiff 조건 무시
-                            const shouldShowAttackerLabel = (this.focusMode && this.selectedEvent && timeMatch) 
+                            const eventToCheckForAttackerLabel = this.selectedEventForZoom || this.selectedEvent;
+                            const shouldShowAttackerLabel = (this.focusMode && eventToCheckForAttackerLabel && timeMatch) 
                                 ? true 
                                 : (timeDiff < 2.0);
                             if (shouldShowAttackerLabel) {
@@ -11927,11 +12492,11 @@ Three.js · PapaParse · Pure JavaScript`
                                     opacity: opacity,
                                     depthTest: false
                                 }));
-                                    // 상단 라벨 위치에 수평으로 배치 (attacker는 왼쪽)
+                                    // ATTACKER 라벨을 attacker 플레이어 위에 바로 배치
                                 attackerSprite.position.set(
                                         attackerLabelX,
                                         attackerLabelTopY,
-                                        midY
+                                        attackerScaledY  // attacker의 Z축 위치
                                     );
                                     // 살짝 더 크게 스케일링하여 키워드 효과 강화
                                     attackerSprite.scale.set(maxWidth * 0.14, height * 0.14, 1);
@@ -11940,10 +12505,10 @@ Three.js · PapaParse · Pure JavaScript`
                             }
                         }
 
-                            // 상단 ATTACKER ↔ DEAD 라벨 사이 빨간 선 (구조 상단 연결)
+                            // ATTACKER ↔ VICTIM 라벨 사이 빨간 선 (두 라벨 연결)
                             const topLineGeom = new THREE.BufferGeometry().setFromPoints([
-                                new THREE.Vector3(attackerLabelX, attackerLabelTopY, midY),
-                                new THREE.Vector3(victimLabelX, victimLabelTopY, midY)
+                                new THREE.Vector3(attackerLabelX, attackerLabelTopY, attackerScaledY),
+                                new THREE.Vector3(victimLabelX, victimLabelTopY, victimScaledY)
                             ]);
                             const topLineMat = new THREE.LineBasicMaterial({
                                 color: 0xff0000,
@@ -11955,7 +12520,7 @@ Three.js · PapaParse · Pure JavaScript`
                             this.scene.add(topLine);
                             this.eventMarkers.push(topLine);
                             
-                            // 상단 라벨과 플레이어를 연결하는 파란색 라인 (ATTACKER/dead 구조를 하단 플레이어와 분리해 시각화)
+                            // 라벨과 플레이어를 연결하는 파란색 라인 (각 플레이어 위에 바로 배치되므로 수직 연결선)
                             const linkMaterial = new THREE.LineBasicMaterial({
                                 color: 0x2a6f9b,
                                 opacity: 0.9,
@@ -11963,18 +12528,18 @@ Three.js · PapaParse · Pure JavaScript`
                                 linewidth: 2
                             });
 
-                            // 공격자: 상단 라벨 → 플레이어 중심
+                            // 공격자: 라벨 → 플레이어 중심 (수직 연결선)
                             const attackerLinkGeom = new THREE.BufferGeometry().setFromPoints([
-                                new THREE.Vector3(attackerLabelX, attackerLabelTopY, midY),
+                                new THREE.Vector3(attackerLabelX, attackerLabelTopY, attackerScaledY),
                                 new THREE.Vector3(attackerScaledX, attackerCenterY, attackerScaledY)
                             ]);
                             const attackerLink = new THREE.Line(attackerLinkGeom, linkMaterial);
                             this.scene.add(attackerLink);
                             this.eventMarkers.push(attackerLink);
 
-                            // 피격자: 상단 라벨 → 플레이어 중심
+                            // 피격자: 라벨 → 플레이어 중심 (수직 연결선)
                             const victimLinkGeom = new THREE.BufferGeometry().setFromPoints([
-                                new THREE.Vector3(victimLabelX, victimLabelTopY, midY),
+                                new THREE.Vector3(victimLabelX, victimLabelTopY, victimScaledY),
                                 new THREE.Vector3(victimScaledX, victimCenterY, victimScaledY)
                             ]);
                             const victimLink = new THREE.Line(victimLinkGeom, linkMaterial);
@@ -12007,7 +12572,8 @@ Three.js · PapaParse · Pure JavaScript`
                             // Victim 'DEAD'/'VICTIM' label with HEADSHOT and weapon info
                             // 정확히 해당 틱에만 표시하고 2초간 페이드아웃
                             // 포커스 모드에서 선택된 이벤트는 timeDiff 조건 무시
-                            const shouldShowDeadLabel = (this.focusMode && this.selectedEvent && timeMatch) 
+                            const eventToCheckForDeadLabel = this.selectedEventForZoom || this.selectedEvent;
+                            const shouldShowDeadLabel = (this.focusMode && eventToCheckForDeadLabel && timeMatch) 
                                 ? true 
                                 : (timeDiff < 2.0);
                             if (shouldShowDeadLabel) {
@@ -12128,11 +12694,11 @@ Three.js · PapaParse · Pure JavaScript`
                                         opacity: opacity,
                                         depthTest: false // 항상 앞에 표시
                                     }));
-                                    // 상단 라벨 위치에 수평으로 배치 (dead는 오른쪽)
+                                    // VICTIM/DEAD 라벨을 victim 플레이어 위에 바로 배치
                                     sprite.position.set(
                                         victimLabelX,
                                         victimLabelTopY,
-                                        midY
+                                        victimScaledY  // victim의 Z축 위치
                                     );
                                     // DEAD 박스도 조금 더 크게
                                     sprite.scale.set(maxWidth * 0.14, height * 0.14, 1);
