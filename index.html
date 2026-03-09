@@ -1062,9 +1062,15 @@
             <div class="sidebar-section">
                 <h3>File Load</h3>
                 <div id="file-input">
-                    <button id="select-csv-btn" style="width: 100%; padding: 10px; background: #4a90e2; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin-bottom: 6px;">파일 선택 (팝업)</button>
-                    <button id="direct-file-btn" style="width: 100%; padding: 10px; background: #28a745; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin-bottom: 10px; font-size: 13px;">📂 로컬 CSV 직접 로드</button>
-                    <div id="selected-file" style="font-size: 12px; color: #8a8fa5; margin-bottom: 10px;">선택된 파일 없음</div>
+                    <div style="font-size: 11px; color: #8a8fa5; margin-bottom: 4px;">① Tick 에임분석 데이터</div>
+                    <button id="direct-file-btn" style="width: 100%; padding: 8px; background: #28a745; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin-bottom: 4px; font-size: 12px;">📂 Tick CSV 로드</button>
+                    <div id="selected-file" style="font-size: 11px; color: #8a8fa5; margin-bottom: 8px;">선택된 파일 없음</div>
+                    
+                    <div style="font-size: 11px; color: #8a8fa5; margin-bottom: 4px;">② 매치 종료 로그 (선택)</div>
+                    <button id="match-end-file-btn" style="width: 100%; padding: 8px; background: #e67e22; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin-bottom: 4px; font-size: 12px;">📋 매치 종료 CSV 로드</button>
+                    <div id="match-end-file-name" style="font-size: 11px; color: #8a8fa5; margin-bottom: 8px;">선택된 파일 없음</div>
+                    
+                    <button id="select-csv-btn" style="width: 100%; padding: 6px; background: #3a3f4e; color: #8a8fa5; border: 1px solid #4a4f5e; border-radius: 4px; cursor: pointer; margin-bottom: 6px; font-size: 11px;">GitHub 팝업 (레거시)</button>
                     <div id="loading" style="display: none;">CSV 파일 처리 중...</div>
                 </div>
             </div>
@@ -1466,6 +1472,35 @@
                     });
                 }
 
+                // 매치 종료 로그 파일 로드 버튼
+                const matchEndBtn = document.getElementById('match-end-file-btn');
+                if (matchEndBtn) {
+                    const matchEndInput = document.createElement('input');
+                    matchEndInput.type = 'file';
+                    matchEndInput.accept = '.csv';
+                    matchEndInput.style.display = 'none';
+                    document.body.appendChild(matchEndInput);
+                    
+                    matchEndInput.addEventListener('change', async (e) => {
+                        const file = e.target.files && e.target.files[0];
+                        if (!file) return;
+                        const fileNameEl = document.getElementById('match-end-file-name');
+                        if (fileNameEl) fileNameEl.textContent = file.name;
+                        try {
+                            await this.loadMatchEndLog(file);
+                        } catch (err) {
+                            console.error('매치 종료 로그 로드 오류:', err);
+                            alert('매치 종료 로그 로드 오류: ' + err.message);
+                        } finally {
+                            matchEndInput.value = '';
+                        }
+                    });
+                    
+                    matchEndBtn.addEventListener('click', () => {
+                        matchEndInput.click();
+                    });
+                }
+
                 // 팝업 닫기 버튼
                 const closeBtn = document.getElementById('csv-popup-close');
                 if (closeBtn) {
@@ -1533,32 +1568,31 @@
                     
                     const anomalySeqs = this.data.metadata.anomalySeqs || [];
                     const events = this.data.events || [];
+                    const matchEndByPlayer = this.data.metadata.matchEndByPlayer || {};
                     
                     players.forEach(playerId => {
-                        // 해당 플레이어의 이상 구간 수 계산
                         const playerAnomalySeqs = anomalySeqs.filter(seq => {
                             if (!seq.players) return false;
-                            if (typeof seq.players.has === 'function') {
-                                return seq.players.has(playerId);
-                            }
-                            if (Array.isArray(seq.players)) {
-                                return seq.players.includes(playerId);
-                            }
-                            return false;
+                            return typeof seq.players.has === 'function' 
+                                ? seq.players.has(playerId) 
+                                : (Array.isArray(seq.players) ? seq.players.includes(playerId) : false);
                         });
                         const anomalyCount = playerAnomalySeqs.filter(s => s.hasAnomalousFlag).length;
                         const totalAnalysisCount = playerAnomalySeqs.length;
                         
-                        // 해당 플레이어의 이벤트 수 계산 (attacker인 이벤트)
                         const playerEvents = events.filter(e => 
                             e.attacker && e.attacker.name === playerId &&
                             (e.event_type_lower === 'kill' || e.event_type_lower === 'hit')
                         );
                         const eventCount = playerEvents.length;
                         
+                        // 닉네임 (매치 종료 로그에서 가져오기)
+                        const endData = matchEndByPlayer[playerId];
+                        const displayName = (endData && endData.name) ? endData.name : playerId;
+                        
                         const option = document.createElement('option');
                         option.value = playerId;
-                        option.textContent = `${playerId} (초과 ${anomalyCount}/${totalAnalysisCount} / 이벤트 ${eventCount})`;
+                        option.textContent = `${displayName} (이상 구간: ${anomalyCount}/${totalAnalysisCount} / 이벤트: ${eventCount})`;
                         playerSelect.appendChild(option);
                     });
                 };
@@ -4273,15 +4307,17 @@ Three.js · PapaParse · Pure JavaScript`
                 
                 // 보고서 생성 탭
                 document.getElementById('report-tab').addEventListener('click', () => {
-                    // 포커스 모드 플레이어를 최우선으로 사용
-                    const playerName = this.focusPlayerId || this.selectedPlayer || 
+                    // 플레이어 선택 드롭다운 값을 최우선으로 사용
+                    const playerSelect = document.getElementById('player-select');
+                    const dropdownPlayerId = playerSelect ? playerSelect.value : null;
+                    
+                    const playerName = dropdownPlayerId || this.focusPlayerId || this.selectedPlayer || 
                                     (this.selectedEvent && this.selectedEvent.attacker && this.selectedEvent.attacker.name) || 
                                     ((this.data && this.data.metadata && this.data.metadata.players && this.data.metadata.players[0]) || null);
                     console.log('[Report] 플레이어 선택:', {
+                        dropdownPlayerId: dropdownPlayerId,
                         focusPlayerId: this.focusPlayerId,
                         selectedPlayer: this.selectedPlayer,
-                        selectedEventAttacker: this.selectedEvent?.attacker?.name,
-                        firstPlayer: this.data?.metadata?.players?.[0],
                         finalPlayerName: playerName
                     });
                     if (playerName) {
@@ -4563,6 +4599,137 @@ Three.js · PapaParse · Pure JavaScript`
                         }
                     }
                 };
+            }
+
+            // 매치 종료 로그 파싱 및 저장
+            async loadMatchEndLog(file) {
+                const loading = document.getElementById('loading');
+                if (loading) {
+                    loading.style.display = 'block';
+                    loading.innerHTML = '매치 종료 로그 파싱 중...';
+                }
+                
+                return new Promise((resolve) => {
+                    if (typeof Papa === 'undefined' || !Papa || !Papa.parse) {
+                        if (loading) loading.innerHTML = 'Error: CSV parser not loaded.';
+                        resolve();
+                        return;
+                    }
+                    Papa.parse(file, {
+                        header: true,
+                        skipEmptyLines: true,
+                        complete: (results) => {
+                            console.log('=== 매치 종료 로그 파싱 완료 ===');
+                            console.log('행 수:', results.data.length);
+                            console.log('헤더:', results.meta.fields);
+                            
+                            // player_id(actor_npgameaccountid) 기준으로 매핑
+                            const matchEndData = new Map();
+                            
+                            const gameTypeMap = { '0': 'None', '1': '일반', '2': '랭킹', '3': '커스텀', '4': '이벤트', '5': 'AI', '6': '튜토리얼' };
+                            const teamTypeMap = { '0': 'None', '1': '솔로', '2': '듀오', '3': '트리오' };
+                            const osMap = { '1': 'Windows', '2': 'MacOS', '3': 'Linux', '4': 'PS5', '5': 'XSX' };
+                            
+                            results.data.forEach(row => {
+                                const npGameAccountId = row.actor_npgameaccountid ? String(row.actor_npgameaccountid).trim() : null;
+                                if (!npGameAccountId) return;
+                                
+                                const gameDbUserNo = row.actor_gamedbuserno ? String(row.actor_gamedbuserno).trim() : null;
+                                const gameTypeCode = row.actor_gametype ? String(row.actor_gametype).trim() : '0';
+                                const teamTypeCode = row.actor_teamtype ? String(row.actor_teamtype).trim() : '0';
+                                
+                                matchEndData.set(npGameAccountId, {
+                                    // 조인 키
+                                    npGameAccountId: npGameAccountId,
+                                    gameDbUserNo: gameDbUserNo,
+                                    // 매치 정보
+                                    logTime: row.logtime || '',
+                                    gameOid: row.actor_gameoid || '',
+                                    gameType: gameTypeMap[gameTypeCode] || gameTypeCode,
+                                    gameTypeCode: gameTypeCode,
+                                    teamType: teamTypeMap[teamTypeCode] || teamTypeCode,
+                                    teamTypeCode: teamTypeCode,
+                                    gameTeam: row.actor_gameteam || '',
+                                    gameMap: row.actor_gamemap || '',
+                                    // 플레이어 정보
+                                    charId: row.actor_char || '',
+                                    name: row.actor_name || '',
+                                    level: row.actor_level || '',
+                                    rank: row.actor_rank || '',
+                                    mmr: row.actor_mmr || '',
+                                    os: osMap[String(row.actor_os || '').trim()] || row.actor_os || '',
+                                    inputDevice: row.data_num7 || '',
+                                    // 매치 결과
+                                    finalRank: row.entity_code || '',
+                                    survivalTimeSec: row.entity_id || '',
+                                    kills: row.data_num2 || '0',
+                                    deaths: row.data_num3 || '0',
+                                    assists: row.data_num4 || '0',
+                                    totalDamage: row.data_num5 || '0',
+                                    accuracy: row.data_num6 || '0',
+                                    // 추가 정보
+                                    hwInfo: row.data_str6 || '',
+                                    graphicsInfo: row.data_str7 || ''
+                                });
+                            });
+                            
+                            this.matchEndData = matchEndData;
+                            console.log(`매치 종료 로그 로드 완료: ${matchEndData.size}명`);
+                            
+                            // 이미 tick 데이터가 로드되어 있으면 UI 업데이트
+                            if (this.data) {
+                                this.applyMatchEndData();
+                                this.updateUI();
+                            }
+                            
+                            if (loading) loading.style.display = 'none';
+                            resolve();
+                        },
+                        error: (error) => {
+                            console.error('매치 종료 로그 파싱 오류:', error);
+                            if (loading) loading.style.display = 'none';
+                            resolve();
+                        }
+                    });
+                });
+            }
+            
+            // 매치 종료 데이터를 기존 데이터에 적용
+            applyMatchEndData() {
+                if (!this.matchEndData || !this.data) return;
+                
+                const m = this.data.metadata;
+                
+                // 첫 번째 매치 종료 데이터에서 매치 공통 정보 추출
+                const firstEntry = this.matchEndData.values().next().value;
+                if (firstEntry) {
+                    if (!m.matchInfo) m.matchInfo = {};
+                    m.matchInfo.game_type = firstEntry.gameType;
+                    m.matchInfo.team_type = firstEntry.teamType;
+                    m.matchInfo.game_map = firstEntry.gameMap;
+                    m.matchInfo.game_oid = firstEntry.gameOid;
+                    m.matchInfo.log_time = firstEntry.logTime;
+                }
+                
+                // 플레이어별 매치 종료 데이터 매핑
+                if (!m.matchEndByPlayer) m.matchEndByPlayer = {};
+                this.matchEndData.forEach((data, playerId) => {
+                    m.matchEndByPlayer[playerId] = data;
+                    
+                    // playerStats에도 반영
+                    const stats = m.playerStats[playerId];
+                    if (stats) {
+                        stats.team = data.gameTeam;
+                        stats.matchEndData = data;
+                    }
+                });
+                
+                console.log('매치 종료 데이터 적용 완료');
+                
+                // 플레이어 선택 드롭다운 갱신
+                if (typeof this.updateFocusPlayerList === 'function') {
+                    this.updateFocusPlayerList();
+                }
             }
 
             async loadCSV(file) {
@@ -7467,7 +7634,7 @@ Three.js · PapaParse · Pure JavaScript`
                 }
                 
                 // 매치 정보
-                const matchId = this.data.metadata.matchInfo?.match_id || this.data.metadata.matchInfo?.matchId || '0';
+                const matchId = this.data.metadata.matchInfo?.game_oid || this.data.metadata.matchInfo?.match_id || this.data.metadata.matchInfo?.matchId || '0';
                 const mapName = this.data.metadata.mapName || 'Unknown';
                 const gameStartTime = this.data.metadata.time_range?.min;
                 const gameEndTime = this.data.metadata.time_range?.max;
@@ -7486,7 +7653,9 @@ Three.js · PapaParse · Pure JavaScript`
                 };
                 
                 const matchStartDate = gameStartTime ? formatKSTDateForReport(gameStartTime) : 'N/A';
-                const matchEndDate = gameEndTime ? formatKSTDateForReport(gameEndTime) : 'N/A';
+                // 매치 종료 로그의 logTime 우선 사용
+                const endLogTime = this.data.metadata.matchInfo?.log_time;
+                const matchEndDate = endLogTime ? endLogTime : (gameEndTime ? formatKSTDateForReport(gameEndTime) : 'N/A');
                 
                 // 언어별 텍스트
                 const t = this.language === 'ko' ? {
@@ -8103,6 +8272,9 @@ Three.js · PapaParse · Pure JavaScript`
                     }
                 });
                 
+                // 해당 플레이어의 매치 종료 데이터
+                const playerEndData = this.matchEndData ? this.matchEndData.get(playerName) : null;
+                
                 // HTML 생성 (템플릿 리터럴 중첩 최소화)
                 const reportHTML = this.buildReportHTML({
                     playerName,
@@ -8113,6 +8285,7 @@ Three.js · PapaParse · Pure JavaScript`
                     detectionSummary,
                     stats,
                     mockData,
+                    playerEndData,
                     survivalTime,
                     anomalySeqCount,
                     top3AnomalySeqs,
@@ -8138,7 +8311,12 @@ Three.js · PapaParse · Pure JavaScript`
             // HTML 생성 헬퍼 메서드 (템플릿 리터럴 중첩 방지)
             buildReportHTML(data) {
                 const { playerName, matchId, matchStartDate, matchEndDate, hasCheatingSuspicion, 
-                        detectionSummary, stats, mockData, survivalTime, anomalySeqCount, top3AnomalySeqs, aimTraceImages, t } = data;
+                        detectionSummary, stats, mockData, playerEndData, survivalTime, anomalySeqCount, top3AnomalySeqs, aimTraceImages, t } = data;
+                
+                // 매치 종료 로그가 있으면 실데이터 사용, 없으면 MOCK
+                const hasEnd = !!playerEndData;
+                const ml = (label, hasReal) => hasReal ? label : `${label} <span style="color:#ff9800;font-size:10px;">[MOCK]</span>`;
+                const v = (realVal, mockVal) => hasEnd ? (realVal || 'N/A') : (mockVal || 'N/A');
                 
                 // CSS 스타일
                 const styles = `
@@ -8193,95 +8371,42 @@ Three.js · PapaParse · Pure JavaScript`
             </div>
             </div>`;
                     }).join('')
-                    : '<p style="color: #8a8fa5;">에임 궤적 데이터가 없습니다. (이상 시퀀스는 있으나, 해당 구간의 조준 데이터가 부족합니다)</p>';
+                    : '<p style="color: #8a8fa5;">에임봇 의심 구간(threshold 초과)이 없어 시각화 대상이 없습니다.</p>';
                 
                 // 유저 정보 HTML (3.1 기본 정보)
-                const playerBasicInfoHTML = `
+                // Helper: info row with dynamic MOCK label
+                const infoRow = (label, value, isReal) => `
             <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Actor_NPGameAccountID:</span>
-                    <span class="info-value" style="display: block;">${playerName}</span>
-            </div>
+                    <span class="info-label" style="display: block; margin-bottom: 5px;">${label}${isReal ? '' : ' <span style="color:#ff9800;font-size:10px;">[MOCK]</span>'}</span>
+                    <span class="info-value" style="display: block;">${value}</span>
+            </div>`;
+                const tickRow = (label, value) => `
             <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Actor_GameDBUserNo: <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.accountId || 'N/A'}</span>
-            </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Actor_Name:</span>
-                    <span class="info-value" style="display: block;">${playerName}</span>
-            </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Actor_Level: <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.level || 'N/A'}</span>
-            </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Actor_Rank: <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.rank || 'N/A'}</span>
-            </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Actor_MMR: <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.mmr || 'N/A'}</span>
-            </div>
-                `;
+                    <span class="info-label" style="display: block; margin-bottom: 5px;">${label} <span style="color:#4fc3f7;font-size:10px;">[TICK 계산]</span></span>
+                    <span class="info-value" style="display: block;">${value}</span>
+            </div>`;
                 
-                // 매치 결과 정보 HTML (3.2 매치 결과 정보)
-                const matchResultInfoHTML = `
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Actor_Char: <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.character || 'N/A'}</span>
-            </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Actor_OS: <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.os || 'N/A'}</span>
-            </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Data_Num7 (입력 장치 정보): <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.inputDevice || 'N/A'}</span>
-        </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Entity_Code (최종 순위): <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.rank || 'N/A'}</span>
-            </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Entity_ID (생존 시간 초): <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${survivalTime.toFixed(1)}</span>
-                </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Data_Num2 (Kill 수): <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${stats.kills}</span>
-        </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Data_Num3 (Death 수): <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${stats.deaths}</span>
-            </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Data_Num4 (어시스트 수): <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${stats.assists || 0}</span>
-                </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Fire 수: <span style="color:#4fc3f7;font-size:10px;">[TICK 계산]</span></span>
-                    <span class="info-value" style="display: block;">${stats.fires || 0}</span>
-                </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Hit 수: <span style="color:#4fc3f7;font-size:10px;">[TICK 계산]</span></span>
-                    <span class="info-value" style="display: block;">${stats.hits || 0}</span>
-                </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">명중률 (Hit/Fire): <span style="color:#4fc3f7;font-size:10px;">[TICK 계산]</span></span>
-                    <span class="info-value" style="display: block;">${stats.fires > 0 ? ((stats.hits || 0) / stats.fires * 100).toFixed(1) : 'N/A'}%</span>
-                </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">헤드샷 킬: <span style="color:#4fc3f7;font-size:10px;">[TICK 계산]</span></span>
-                    <span class="info-value" style="display: block;">${stats.headshotKills || 0}</span>
-                </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Data_Num5 (총 데미지): <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.totalDamage || 'N/A'}</span>
-                                                </div>
-            <div class="info-row" style="border: 1px solid #3a3f4e; padding: 10px; border-radius: 4px; background: #1a1f2e; margin-bottom: 10px;">
-                    <span class="info-label" style="display: block; margin-bottom: 5px;">Data_Num6 (명중률): <span style="color:#ff9800;font-size:10px;">[MOCK]</span></span>
-                    <span class="info-value" style="display: block;">${mockData.accuracy || 'N/A'}%</span>
-            </div>
-                `;
+                const e = playerEndData; // shorthand
+                
+                const playerBasicInfoHTML = 
+                    infoRow('Actor_NPGameAccountID', playerName, true) +
+                    infoRow('Actor_GameDBUserNo', e ? e.gameDbUserNo : (mockData.accountId || 'N/A'), hasEnd) +
+                    infoRow('Actor_Name', e ? e.name : playerName, hasEnd) +
+                    infoRow('Actor_Level', e ? e.level : (mockData.level || 'N/A'), hasEnd) +
+                    infoRow('Actor_Rank', e ? e.rank : (mockData.rank || 'N/A'), hasEnd) +
+                    infoRow('Actor_MMR', e ? e.mmr : (mockData.mmr || 'N/A'), hasEnd);
+                
+                const matchResultInfoHTML = 
+                    infoRow('Actor_Char', e ? e.charId : (mockData.character || 'N/A'), hasEnd) +
+                    infoRow('Actor_OS', e ? e.os : (mockData.os || 'N/A'), hasEnd) +
+                    infoRow('Data_Num7 (입력 장치 정보)', e ? e.inputDevice : (mockData.inputDevice || 'N/A'), hasEnd) +
+                    infoRow('Entity_Code (최종 순위)', e ? e.finalRank : (mockData.rank || 'N/A'), hasEnd) +
+                    infoRow('Entity_ID (생존 시간 초)', e ? e.survivalTimeSec : survivalTime.toFixed(1), hasEnd) +
+                    infoRow('Data_Num2 (Kill 수)', e ? e.kills : stats.kills, hasEnd) +
+                    infoRow('Data_Num3 (Death 수)', e ? e.deaths : stats.deaths, hasEnd) +
+                    infoRow('Data_Num4 (Support 점수)', e ? e.assists : (stats.assists || 0), hasEnd) +
+                    infoRow('Data_Num5 (총 데미지)', e ? e.totalDamage : (mockData.totalDamage || 'N/A'), hasEnd) +
+                    infoRow('Data_Num6 (명중률)', e ? e.accuracy : (mockData.accuracy || 'N/A'), hasEnd);
                 
                 // 보고서 생성 시간 포맷 (YYYY. M. D. 오후/오전 H:MM:SS 형식)
                 const reportGenTime = new Date();
@@ -8340,17 +8465,17 @@ Three.js · PapaParse · Pure JavaScript`
     </div>
     
     <div class="section">
-        <h2 class="section-title">3. 유저 정보 및 참여 매치 정보 <span style="color:#ff9800;font-size:14px;font-weight:normal;">[전체 MOCK — 매치 종료 로그 연동 필요]</span></h2>
+        <h2 class="section-title">3. 유저 정보 및 참여 매치 정보 ${hasEnd ? '<span style="color:#51cf66;font-size:14px;font-weight:normal;">[매치 종료 로그 연동됨]</span>' : '<span style="color:#ff9800;font-size:14px;font-weight:normal;">[전체 MOCK — 매치 종료 로그 연동 필요]</span>'}</h2>
         
         <div class="subsection">
-            <h3 style="color: #8a8fa5; font-size: 16px; margin-bottom: 15px;">3.1 기본 정보 <span style="color:#ff9800;font-size:11px;">[MOCK]</span></h3>
+            <h3 style="color: #8a8fa5; font-size: 16px; margin-bottom: 15px;">3.1 기본 정보${hasEnd ? '' : ' <span style="color:#ff9800;font-size:11px;">[MOCK]</span>'}</h3>
             <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
                 ${playerBasicInfoHTML}
             </div>
         </div>
         
         <div class="subsection">
-            <h3 style="color: #8a8fa5; font-size: 16px; margin-bottom: 15px; margin-top: 20px;">3.2 매치 결과 정보 <span style="color:#ff9800;font-size:11px;">[MOCK]</span></h3>
+            <h3 style="color: #8a8fa5; font-size: 16px; margin-bottom: 15px; margin-top: 20px;">3.2 매치 결과 정보${hasEnd ? '' : ' <span style="color:#ff9800;font-size:11px;">[MOCK]</span>'}</h3>
             <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
                 ${matchResultInfoHTML}
             </div>
@@ -9474,12 +9599,8 @@ Three.js · PapaParse · Pure JavaScript`
 
                 const m = this.data.metadata;
                 
-                // 맵 이름 업데이트
+                // 맵 이름 (기본값 - 아래에서 매치 종료 로그로 덮어씀)
                 const mapName = m.mapName || this.detectedMapName || 'Unknown';
-                const mapNameElement = document.getElementById('map-name');
-                if (mapNameElement) {
-                    mapNameElement.textContent = mapName;
-                }
                 
                 // 맵 정보 텍스트 업데이트
                 const detectedMapNameElement = document.getElementById('detected-map-name');
@@ -9490,34 +9611,90 @@ Three.js · PapaParse · Pure JavaScript`
                 }
                 
                 // 매치 참여 정보 업데이트
-                // Match ID
+                const hasMatchEnd = !!this.matchEndData && this.matchEndData.size > 0;
+                
+                // Match ID — 매치 종료 로그의 actor_gameoid 우선, 없으면 tick의 match_id
                 const matchIdElement = document.getElementById('match-id');
-                if (matchIdElement && m.matchInfo && m.matchInfo.match_id !== null) {
-                    matchIdElement.textContent = m.matchInfo.match_id;
-                } else if (matchIdElement) {
-                    matchIdElement.textContent = '-';
+                if (matchIdElement) {
+                    const gameOid = m.matchInfo?.game_oid;
+                    const tickMatchId = m.matchInfo?.match_id;
+                    if (gameOid && gameOid !== '0' && gameOid !== '') {
+                        matchIdElement.textContent = gameOid;
+                    } else if (tickMatchId && tickMatchId !== '0' && tickMatchId !== null) {
+                        matchIdElement.textContent = tickMatchId;
+                    } else {
+                        matchIdElement.textContent = '-';
+                    }
                 }
                 
-                // 게임 타입 (실제 데이터 우선, 없으면 Mock 데이터)
+                // 매치 종료 시각 — 매치 종료 로그의 logTime 우선
+                const matchEndTimeElement = document.getElementById('match-end-time');
+                if (matchEndTimeElement) {
+                    const endLogTime = m.matchInfo?.log_time;
+                    if (endLogTime && endLogTime !== '') {
+                        matchEndTimeElement.textContent = endLogTime;
+                        // MOCK 라벨 제거
+                        const label = matchEndTimeElement.closest('.stat-item')?.querySelector('.stat-label');
+                        if (label) label.innerHTML = '매치 종료 시각:';
+                    } else {
+                        // fallback: tick timestamp 기반
+                        const formatKSTDateTime = (timestamp) => {
+                            const ms = timestamp < 10000000000 ? timestamp * 1000 : timestamp;
+                            const date = new Date(ms);
+                            return date.toLocaleString(this.language === 'ko' ? 'ko-KR' : 'en-US', {
+                                year: 'numeric', month: '2-digit', day: '2-digit',
+                                hour: '2-digit', minute: '2-digit', second: '2-digit',
+                                timeZone: 'Asia/Seoul'
+                            });
+                        };
+                        matchEndTimeElement.textContent = m.time_range.max ? formatKSTDateTime(m.time_range.max) : '-';
+                    }
+                }
+                
+                // 맵 — 매치 종료 로그의 actor_gamemap 우선
+                const mapNameElement = document.getElementById('map-name');
+                if (mapNameElement) {
+                    const endMapId = m.matchInfo?.game_map;
+                    const mapName = this.detectedMapName || m.mapName || 'Unknown';
+                    if (endMapId && endMapId !== '' && endMapId !== '0') {
+                        mapNameElement.textContent = `Map #${endMapId}`;
+                        const label = mapNameElement.closest('.stat-item')?.querySelector('.stat-label');
+                        if (label) label.innerHTML = '맵:';
+                    } else {
+                        mapNameElement.textContent = mapName;
+                    }
+                }
+                
+                // 게임 타입 (매치 종료 로그 우선, 없으면 Mock)
                 const gameTypeElement = document.getElementById('game-type');
                 if (gameTypeElement) {
-                    // 실제 데이터가 있으면 사용, 없으면 Mock 데이터 생성
+                    const hasRealData = !!m.matchInfo?.game_type;
                     const gameType = m.matchInfo?.game_type || (() => {
                         const mockData = this.generateMockData ? this.generateMockData('', {}) : null;
                         return mockData && mockData.gameType ? mockData.gameType : '-';
                     })();
                     gameTypeElement.textContent = gameType;
+                    // MOCK 라벨 동적 업데이트
+                    const label = gameTypeElement.closest('.stat-item')?.querySelector('.stat-label');
+                    if (label) label.innerHTML = hasRealData 
+                        ? '매치 타입:' 
+                        : '매치 타입: <span style="color:#ff9800;font-size:9px;">[MOCK]</span>';
                 }
                 
-                // 팀 타입 (실제 데이터 우선, 없으면 Mock 데이터)
+                // 팀 타입 (매치 종료 로그 우선, 없으면 Mock)
                 const teamTypeElement = document.getElementById('team-type');
                 let teamType = '-';
                 if (teamTypeElement) {
+                    const hasRealData = !!m.matchInfo?.team_type;
                     teamType = m.matchInfo?.team_type || (() => {
                         const mockData = this.generateMockData ? this.generateMockData('', {}) : null;
                         return mockData && mockData.teamType ? mockData.teamType : '-';
                     })();
                     teamTypeElement.textContent = teamType;
+                    const label = teamTypeElement.closest('.stat-item')?.querySelector('.stat-label');
+                    if (label) label.innerHTML = hasRealData 
+                        ? '팀 타입:' 
+                        : '팀 타입: <span style="color:#ff9800;font-size:9px;">[MOCK]</span>';
                 }
                 
                 // 팀 개수 계산 (팀 타입에 따라)
@@ -9544,26 +9721,7 @@ Three.js · PapaParse · Pure JavaScript`
                     teamCountElement.textContent = '-';
                 }
                 
-                // 매치 종료 시각
-                const matchEndTimeElement = document.getElementById('match-end-time');
-                if (matchEndTimeElement) {
-                    // Unix timestamp를 KST로 변환하여 표시
-                    const formatKSTDateTime = (timestamp) => {
-                        const ms = timestamp < 10000000000 ? timestamp * 1000 : timestamp;
-                        const date = new Date(ms);
-                        const kstDate = new Date(date.getTime() + (9 * 60 * 60 * 1000));
-                        return kstDate.toLocaleString(this.language === 'ko' ? 'ko-KR' : 'en-US', {
-                            year: 'numeric',
-                            month: '2-digit',
-                            day: '2-digit',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                            second: '2-digit',
-                            timeZone: 'Asia/Seoul'
-                        });
-                    };
-                    matchEndTimeElement.textContent = m.time_range.max ? formatKSTDateTime(m.time_range.max) : '-';
-                }
+                // (매치 종료 시각은 위에서 처리됨)
                 
 
                 // 플레이어 리스트 (K/D/A)
@@ -9575,38 +9733,33 @@ Three.js · PapaParse · Pure JavaScript`
                 
                 m.players.forEach((name, index) => {
                     const stats = m.playerStats[name] || { kills: 0, deaths: 0, assists: 0, team: '' };
-                    const assists = stats.assists || 0;
                     
-                    // 목업: 플레이어 이름 기반으로 일관된 팀 번호 생성 (1~팀개수)
-                    const playerCount = m.players.length;
-                    const teamType = m.matchInfo?.team_type || (() => {
-                        const mockData = this.generateMockData ? this.generateMockData('', {}) : null;
-                        return mockData && mockData.teamType ? mockData.teamType : '스쿼드';
+                    // 매치 종료 데이터가 있으면 실데이터 사용
+                    const endData = m.matchEndByPlayer ? m.matchEndByPlayer[name] : null;
+                    const hasRealData = !!endData;
+                    
+                    const teamNumber = hasRealData ? endData.gameTeam : (() => {
+                        // 팀 번호 MOCK
+                        const playerCount = m.players.length;
+                        let hash = 0;
+                        for (let i = 0; i < name.length; i++) {
+                            hash = ((hash << 5) - hash) + name.charCodeAt(i);
+                            hash = hash & hash;
+                        }
+                        const maxTeams = Math.max(1, Math.ceil(playerCount / 4));
+                        return (Math.abs(hash) % maxTeams) + 1;
                     })();
                     
-                    let maxTeams = 1;
-                    if (teamType === '솔로') {
-                        maxTeams = playerCount;
-                    } else if (teamType === '듀오') {
-                        maxTeams = Math.ceil(playerCount / 2);
-                    } else if (teamType === '트리오') {
-                        maxTeams = Math.ceil(playerCount / 3);
-                    } else if (teamType === '스쿼드') {
-                        maxTeams = Math.ceil(playerCount / 4);
-                    }
-                    
-                    // 플레이어 이름의 해시값을 사용하여 일관된 팀 번호 생성
-                    let hash = 0;
-                    for (let i = 0; i < name.length; i++) {
-                        hash = ((hash << 5) - hash) + name.charCodeAt(i);
-                        hash = hash & hash; // Convert to 32bit integer
-                    }
-                    const teamNumber = (Math.abs(hash) % maxTeams) + 1;
+                    const kills = hasRealData ? endData.kills : stats.kills;
+                    const deaths = hasRealData ? endData.deaths : stats.deaths;
+                    const assists = hasRealData ? (endData.assists || 0) : (stats.assists || 0);
+                    const displayName = hasRealData && endData.name ? endData.name : name;
                     
                     const item = document.createElement('div');
                     item.className = `player-item ${stats.team.toLowerCase()}`;
+                    const mockStyle = hasRealData ? '' : 'color:#ff9800;';
                     item.innerHTML = `
-                        <span>${name}, <span style="color:#ff9800;">(${teamNumber})</span>, <span style="color:#ff9800;">${stats.kills}/${stats.deaths}/${assists}</span></span>
+                        <span title="${name}">${displayName}, <span style="${mockStyle}">(${teamNumber})</span>, <span style="${mockStyle}">${kills}/${deaths}/${assists}</span></span>
                     `;
                     item.style.cursor = 'pointer';
                     item.style.fontSize = '11px';
